@@ -18,6 +18,7 @@ _EXPORTS = {
         "all_to_allv_grouped_matmul",
         "grouped_matmul_all_to_allv",
     ],
+    "quant_matmul_alltoall": ["destroy_qmma_group", "init_qmma_group", "quant_matmul_alltoall"],
     "runtime": [
         "UdmaConfig",
         "destroy_udma_group",
