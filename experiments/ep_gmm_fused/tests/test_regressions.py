@@ -38,6 +38,83 @@ def test_qmma_plan_and_replay(tmp_path):
     assert "--nproc_per_node=4" in plan["commands"][0]
 
 
+@pytest.mark.parametrize(
+    ("world_size", "ranks_per_node", "case_id", "category"),
+    [
+        (8, 4, "bf16-k4096-small-m17", "qmma_bf16_small_m"),
+        (16, 8, "bf16-k4096-small-m17", "qmma_bf16_small_m"),
+        (32, 16, "mxfp8-m10000", "qmma_mxfp8"),
+    ],
+)
+def test_qmma_cross_node_plan(tmp_path, world_size, ranks_per_node, case_id, category):
+    import json
+
+    from .run import main
+
+    common = [
+        "accuracy",
+        "--operator",
+        "quant_matmul_alltoall",
+        "--suite",
+        "qmma",
+        "--ep-size",
+        str(world_size),
+        "--nnodes",
+        "2",
+        "--nproc-per-node",
+        str(ranks_per_node),
+        "--case-id",
+        case_id,
+        "--master-addr",
+        "192.0.2.10",
+        "--dry-run",
+        "--output",
+        str(tmp_path),
+        "--run-id",
+        "dual-node",
+    ]
+    assert main([*common, "--node-rank", "0"]) == 0
+    plan = json.loads((tmp_path / "dual-node" / "plan.json").read_text())
+    assert plan["selections"] == [
+        {
+            "case_id": case_id,
+            "world_size": world_size,
+            "node_count": 2,
+            "ranks_per_node": ranks_per_node,
+            "category": category,
+            "scenario": {"category": category},
+        }
+    ]
+    command = plan["commands"][0]
+    assert "--nnodes=2" in command
+    assert "--node_rank=0" in command
+    assert f"--nproc_per_node={ranks_per_node}" in command
+
+
+def test_qmma_ep32_uses_aligned_quantized_cases():
+    from .framework.qmma_cases import qmma_cases
+
+    cases = qmma_cases(seed=1, ep_size=32)
+    assert cases
+    assert all(case.n % (256 * case.ep_size) == 0 for case in cases)
+    assert all(case.format in {"mxfp8", "mxfp4"} for case in cases)
+
+
+@pytest.mark.parametrize(
+    "ep_size,nnodes,nproc,match",
+    [
+        (16, 2, 4, "one EP group"),
+        (32, 1, 32, "at most 16 ranks per node"),
+        (32, 3, 8, "at most 2 nodes"),
+    ],
+)
+def test_qmma_rejects_unsupported_topologies(ep_size, nnodes, nproc, match):
+    from .framework.qmma_cases import validate_qmma_topology
+
+    with pytest.raises(ValueError, match=match):
+        validate_qmma_topology(ep_size=ep_size, nnodes=nnodes, nproc_per_node=nproc)
+
+
 @pytest.fixture(scope="module")
 def tiling():
     path = COMPONENT / "python/deep_ep_experimental/ep_gmm_fused/_tiling.py"

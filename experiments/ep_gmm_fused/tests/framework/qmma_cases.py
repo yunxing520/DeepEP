@@ -5,7 +5,10 @@
 from dataclasses import asdict, dataclass
 
 QMMA = "quant_matmul_alltoall"
-QMMA_EP_SIZES = (2, 4, 8, 16)
+QMMA_EP_SIZES = (2, 4, 8, 16, 32)
+QMMA_MAX_NODES = 2
+QMMA_MAX_WORLD_SIZE = 32
+QMMA_MAX_RANKS_PER_NODE = 16
 FORMAT_NAMES = ("mxfp8", "mxfp4", "bf16")
 
 
@@ -64,8 +67,31 @@ def qmma_cases(seed: int, ep_size: int) -> list[QmmaCase]:
     return [
         QmmaCase(format=fmt, m=m, n=n, k=k, ep_size=ep_size, seed=seed, scenario={"category": category})
         for category, fmt, n, k, m_values in _GROUPS
+        if n % (256 * ep_size) == 0
         for m in m_values
     ]
+
+
+def validate_qmma_topology(*, ep_size: int, nnodes: int, nproc_per_node: int | None):
+    """Validate the one-group topology supported by the QMMA SHMEM runtime."""
+    if ep_size not in QMMA_EP_SIZES:
+        raise ValueError(f"QMMA requires EP in {QMMA_EP_SIZES}")
+    if nnodes not in range(1, QMMA_MAX_NODES + 1):
+        raise ValueError(f"QMMA supports at most {QMMA_MAX_NODES} nodes")
+    if nproc_per_node is None:
+        if nnodes != 1:
+            raise ValueError("multi-node QMMA requires --nproc-per-node")
+        nproc_per_node = ep_size
+    if nproc_per_node < 1:
+        raise ValueError("QMMA ranks per node must be positive")
+    world_size = nnodes * nproc_per_node
+    if world_size > QMMA_MAX_WORLD_SIZE:
+        raise ValueError(f"QMMA supports at most {QMMA_MAX_WORLD_SIZE} ranks")
+    if world_size != ep_size:
+        raise ValueError("QMMA requires one EP group spanning all launched ranks")
+    if nproc_per_node > QMMA_MAX_RANKS_PER_NODE:
+        raise ValueError(f"QMMA supports at most {QMMA_MAX_RANKS_PER_NODE} ranks per node")
+    return nnodes, nproc_per_node, world_size
 
 
 def required_symmetric_bytes(case: QmmaCase) -> int:
