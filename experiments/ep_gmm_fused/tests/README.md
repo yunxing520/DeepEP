@@ -202,6 +202,29 @@ case ID 根据完整配置生成；默认 seed=20260920 时，原 6 个 EP8 回�
 | gmm_alltoallv | 3072→3584 | false | `a5a9bae68cd35dfa` |
 | gmm_alltoallv | 6144→3584 | false | `40cfbabfd445b46c` |
 
+## QuantMatmulAllToAll 形状用例
+
+[用例清单](quant_matmul_alltoall_cases.py) 共 50 条：MXFP8、MXFP4 各 10 条，
+BF16 的三组 shape 各 10 条。所有 M/N/K 都是单卡逻辑大小：每个源 rank 输入
+`A[M,K]` 和相同的 `B[K,N]`，发往目标 rank 的列宽为 `N/EP`；目标输出为
+按源 rank 顺序拼接的 BF16 `[EP*M,N/EP]`。输入值和 MX scale 随行、列及 K 分组变化，
+各 rank 分块逐元素比较输出，避免为大 shape 创建完整的参考输出。
+
+在 DeepEP 仓库根目录运行。列清单无需设备；执行用例需要已安装包含 QMMA 的
+`ascend-deepep` wheel 和同节点 Ascend950 设备。建议先从 BF16 的小 M 用例开始：
+
+```bash
+python -m experiments.ep_gmm_fused.tests.quant_matmul_alltoall --list
+torchrun --standalone --nproc-per-node=8 -m experiments.ep_gmm_fused.tests.quant_matmul_alltoall \
+  --case bf16-k4096-small-m17
+python -m experiments.ep_gmm_fused.tests.quant_matmul_alltoall --all --ep-size 8
+```
+
+`--list` 和 `--all` 可用 `--format mxfp8`、`--format mxfp4` 或 `--format bf16` 筛选。
+整套执行为每条用例启动独立进程组，日志保存在 `benchmark-runs/ep_gmm_fused/qmma-*/`。
+默认按用例估算 SHMEM heap，可用 `--heap-size <bytes>` 覆盖。300000 行 MXFP8 在 EP8
+时每卡的对称区约 9.2 GiB，输入和输出另需约 7.0 GiB，还需为运行时和分配器留出空间。
+
 ## 性能
 
 ```bash
