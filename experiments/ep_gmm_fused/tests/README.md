@@ -5,6 +5,16 @@ Modified by zhu-mingzhe71 2026
 
 # EP_GMM_FUSED 验证工程
 
+`tests` 下各部分用途：`framework/cases.py` 和 `framework/catalog.py` 生成可复现的 case 与用例分类，
+`framework/worker.py` 在各 rank 执行设备测试；`reference/` 生成参考结果并逐元素校验，
+`test_regressions.py` 则在 CPU 上检查 Python/C++ 参数校验、tiling 预算和 Tensor 契约。
+`scheduling_cases.json` 专门覆盖固定 tiling、缓冲复用和路由形态。
+`accuracy` 验证输出正确性，`bench` 采集 kernel 耗时，`profile` 采集设备时间线，`report` 汇总已有结果。
+
+`alltoallv_gmm`（`all_to_allv_grouped_mat_mul_udma`）先按路由把输入发给专家所在的 rank，再做分组矩阵乘。
+`gmm_alltoallv`（`grouped_mat_mul_all_to_allv_udma`）先做各专家的分组矩阵乘，再将结果发回源 rank。
+`composition` 将两者串起来，验证分发后的布局和回传的行顺序能对上。
+
 从仓库根运行。设备 worker 会排除当前仓库的两个包源码路径，
 从当前 Python 环境的同一份 `ascend-deepep` wheel 加载 `deep_ep` 和 `deep_ep_experimental.ep_gmm_fused`。
 无需切换工作目录或创建临时软链接。该规则对 accuracy、bench 和 profile 一致生效。
@@ -202,28 +212,33 @@ case ID 根据完整配置生成；默认 seed=20260920 时，原 6 个 EP8 回�
 | gmm_alltoallv | 3072→3584 | false | `a5a9bae68cd35dfa` |
 | gmm_alltoallv | 6144→3584 | false | `40cfbabfd445b46c` |
 
-## QuantMatmulAllToAll 形状用例
+## QuantMatmulAllToAll
 
-[用例清单](quant_matmul_alltoall_cases.py) 共 50 条：MXFP8、MXFP4 各 10 条，
-BF16 的三组 shape 各 10 条。所有 M/N/K 都是单卡逻辑大小：每个源 rank 输入
-`A[M,K]` 和相同的 `B[K,N]`，发往目标 rank 的列宽为 `N/EP`；目标输出为
-按源 rank 顺序拼接的 BF16 `[EP*M,N/EP]`。输入值和 MX scale 随行、列及 K 分组变化，
-各 rank 分块逐元素比较输出，避免为大 shape 创建完整的参考输出。
-
-在 DeepEP 仓库根目录运行。列清单无需设备；执行用例需要已安装包含 QMMA 的
-`ascend-deepep` wheel 和同节点 Ascend950 设备。建议先从 BF16 的小 M 用例开始：
+QMMA 的 [50 个单卡形状](framework/qmma_cases.py)使用同一套 manifest、筛选、torchrun 和报告流程。
+`qmma` 是独立的精度套件；`all` 仍指两个 GMM 算子的 smoke、model 和 generalization。
+所有 M/N/K 都是单卡逻辑大小：每个源 rank 输入 `A[M,K]` 和相同的 `B[K,N]`，
+目标只接收其 `N/EP` 列，输出为按源 rank 顺序拼接的 BF16 `[EP*M,N/EP]`。
+覆盖 MXFP8、MXFP4 各 10 条，BF16 的 K=3328 大 M、K=4096 大 M 和小 M 各 10 条。
+结构化输入按行、列和 K 分组变化；测试用 CPU 参考逐块精确比较 BF16 输出，检查量化 scale、源 rank 顺序和列切片。
 
 ```bash
-python -m experiments.ep_gmm_fused.tests.quant_matmul_alltoall --list
-torchrun --standalone --nproc-per-node=8 -m experiments.ep_gmm_fused.tests.quant_matmul_alltoall \
-  --case bf16-k4096-small-m17
-python -m experiments.ep_gmm_fused.tests.quant_matmul_alltoall --all --ep-size 8
+# 只生成用例、manifest 和执行计划，无需 NPU
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall --dry-run
+# 在单节点 8 卡 Ascend950 上执行全部 50 条
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall --ep-size 8
+# 单跑 EP8、BF16、M=17（默认 seed）
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
+  --ep-size 8 --case-id bf16-k4096-small-m17
 ```
 
-`--list` 和 `--all` 可用 `--format mxfp8`、`--format mxfp4` 或 `--format bf16` 筛选。
-整套执行为每条用例启动独立进程组，日志保存在 `benchmark-runs/ep_gmm_fused/qmma-*/`。
-默认按用例估算 SHMEM heap，可用 `--heap-size <bytes>` 覆盖。300000 行 MXFP8 在 EP8
-时每卡的对称区约 9.2 GiB，输入和输出另需约 7.0 GiB，还需为运行时和分配器留出空间。
+默认 EP8，可选 EP2/4/16。可用 `--category qmma_mxfp8`、`qmma_mxfp4`、`qmma_bf16_k3328`、
+`qmma_bf16_large_m` 或 `qmma_bf16_small_m` 选择形状组。case ID 根据格式与形状命名；用
+`--cases <cases.json>` 可重放清单，并用 `--case-id` 筛选单条。
+
+运行设备测试需要安装包含 QMMA 的 `ascend-deepep` wheel 和同节点 Ascend950 设备。
+默认逐 case 估算 SHMEM heap，并为每条 case 建立独立 torchrun 任务；报告和日志遵循统一的
+`benchmark-runs/ep_gmm_fused/<run-id>/` 目录结构。M=300000 的 MXFP8 EP8 case 还需给
+每卡约 9.2 GiB 对称区和约 7.0 GiB 输入/输出数据预留显存，并给运行时和分配器留余量。
 
 ## 性能
 

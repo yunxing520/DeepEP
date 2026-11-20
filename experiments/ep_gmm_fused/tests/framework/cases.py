@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import random
 
+from .qmma_cases import QMMA, QmmaCase, qmma_cases
+
 ROUTES = ("balanced", "random", "hot_expert", "hot_rank", "local", "remote", "ring", "empty_experts")
 DATA = ("normal", "uniform", "zero", "small", "sparse", "cancellation", "outliers", "labels")
 
@@ -63,11 +65,16 @@ class CaseSpec:
         return {"case_id": self.case_id, **asdict(self)}
 
 
+def case_from_record(item):
+    kind = QmmaCase if item.get("operator") == QMMA else CaseSpec
+    return kind(**{k: v for k, v in item.items() if k != "case_id"})
+
+
 def load_cases(path):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("schema_version") != 1:
         raise ValueError("unsupported case schema")
-    cases = [CaseSpec(**{k: v for k, v in item.items() if k != "case_id"}) for item in data["cases"]]
+    cases = [case_from_record(item) for item in data["cases"]]
     if not cases or len({c.case_id for c in cases}) != len(cases):
         raise ValueError("case selection is empty or contains duplicates")
     return cases
@@ -94,7 +101,9 @@ def pairwise(factors):
         yield dict(zip(names, best))
 
 
-def generate(suite="smoke", seed=20260920, random_count=24):
+def generate(suite="smoke", seed=20260920, random_count=24, *, qmma_ep_size=8):
+    if suite == "qmma":
+        return qmma_cases(seed, qmma_ep_size)
     if suite in ("model", "generalization", "all"):
         from .catalog import generate_catalog
 

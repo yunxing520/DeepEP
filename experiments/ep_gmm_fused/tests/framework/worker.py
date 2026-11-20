@@ -16,8 +16,9 @@ import subprocess
 import sys
 import time
 
-from .cases import CaseSpec
+from .cases import case_from_record
 from .installed import load_installed_ep_gmm_fused
+from .qmma_cases import QMMA, required_symmetric_bytes
 from ..reference.golden import route_matrix
 from ..reference.routing import route_statistics
 from ..reference.streaming import ReferenceStore, check_streaming
@@ -201,14 +202,71 @@ def check(case, rank, call, table, torch, npu, *, backend="npu-fp32", block_rows
     return streamed
 
 
+def run_qmma(args, case, package, torch, dist, torch_npu):
+    from ..reference.qmma import check_qmma_output, make_qmma_inputs
+
+    if args.mode != "accuracy" or args.bootstrap != "group":
+        raise ValueError("QMMA requires accuracy mode with group bootstrap")
+    rank, local_rank, size, local_size = (
+        int(os.environ[key]) for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+    )
+    if size != case.ep_size or size != local_size:
+        raise ValueError("QMMA tests require one EP group on a single node")
+    heap_size = required_symmetric_bytes(case)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    report = {
+        "case": case.record(),
+        "global_rank": rank,
+        "ep_rank": rank,
+        "domain": 0,
+        "mode": args.mode,
+        "accuracy_checked": False,
+        "requested_heap_bytes": heap_size,
+    }
+    try:
+        torch_npu.npu.set_device(local_rank)
+        report["environment"] = environment(torch, torch_npu, package)
+        dist.init_process_group("hccl", timeout=timedelta(seconds=args.timeout))
+        package.init_qmma_group(group=dist.group.WORLD, local_rank=local_rank, heap_size=heap_size)
+        inputs, reference = make_qmma_inputs(torch, case, f"npu:{local_rank}", rank, block_rows=args.golden_block_rows)
+        result = package.quant_matmul_alltoall(*inputs, format=case.format)
+        accuracy = {"passed": True, "backend": "structured-cpu", "comparison": "exact-bf16"}
+        try:
+            check_qmma_output(torch, result, reference, case, rank, block_rows=args.golden_block_rows)
+        except AssertionError as error:
+            accuracy.update(passed=False, error=str(error))
+        report["accuracy"] = accuracy
+        report["accuracy_checked"] = True
+        passed = torch.tensor([int(accuracy["passed"])], dtype=torch.int32, device=f"npu:{local_rank}")
+        dist.all_reduce(passed, op=dist.ReduceOp.MIN)
+        all_ranks_passed = bool(passed.item())
+        # The reduction confirms that every rank has finished accessing its output.
+        package.destroy_qmma_group()
+        dist.destroy_process_group()
+        if not all_ranks_passed:
+            raise AssertionError("QMMA output check failed on at least one rank")
+        report["passed"] = True
+    except Exception as error:
+        report.update(passed=False, error=repr(error))
+        raise
+    finally:
+        (output / f"rank-{rank}.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
 def run(args):
+    case = case_from_record(json.loads(Path(args.case).read_text()))
     package = load_installed_ep_gmm_fused()
     import torch
     import torch.distributed as dist
     import torch_npu
+
+    if case.operator == QMMA:
+        run_qmma(args, case, package, torch, dist, torch_npu)
+        return
+
     from .scenarios import domain_groups, run_sequence
 
-    case = CaseSpec(**json.loads(Path(args.case).read_text()))
     validate_accuracy = args.mode != "bench"
     scenario = case.scenario or {}
     if args.mode != "accuracy" and (
@@ -404,14 +462,15 @@ def main():
     parser.add_argument("--reference-cache", help="local scratch directory for temporary reference inputs")
     args = parser.parse_args()
     if args.profiler_config:
-        from .cases import CaseSpec
         from ..profiling.timeline import Profiler, command, discover, inspect_capture
 
+        case = case_from_record(json.loads(Path(args.case).read_text()))
+        if case.operator == QMMA:
+            raise ValueError("QMMA cases support only accuracy")
         config = json.loads(Path(args.profiler_config).read_text())
         profiler = Profiler(**config["profiler"]) if config["profiler"] else discover(config["metric"])
         if args.mode == "bench" and config["metric"] != "op_summary":
             raise ValueError("bench requires msprof op_summary collection")
-        case = CaseSpec(**json.loads(Path(args.case).read_text()))
         rank_dir = Path(args.output) / f"profile-rank-{os.environ['RANK']}"
         arguments = sys.argv[1:]
         index = arguments.index("--profiler-config")

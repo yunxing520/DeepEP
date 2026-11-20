@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 from .framework.cases import generate, load_cases, save_cases
+from .framework.qmma_cases import QMMA, QMMA_EP_SIZES
 from .performance.metrics import summarize
 
 
@@ -135,11 +136,11 @@ def report_run(root, baseline=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("accuracy", "bench", "profile", "report"))
-    parser.add_argument("--suite", choices=("smoke", "model", "generalization", "all", "nightly"), default="smoke")
+    parser.add_argument("--suite", choices=("smoke", "model", "generalization", "all", "nightly", "qmma"))
     parser.add_argument("--cases", help="saved schema_version=1 case manifest (exact replay)")
     parser.add_argument("--case-id")
-    parser.add_argument("--ep-size", type=int, choices=(1, 2, 4, 8))
-    parser.add_argument("--operator", choices=("alltoallv_gmm", "gmm_alltoallv", "composition"))
+    parser.add_argument("--ep-size", type=int, choices=(1, *QMMA_EP_SIZES))
+    parser.add_argument("--operator", choices=("alltoallv_gmm", "gmm_alltoallv", "composition", QMMA))
     parser.add_argument("--category", action="append", help="include category; repeat to select several")
     parser.add_argument("--exclude-category", action="append", default=[])
     parser.add_argument("--model", help="model ID substring")
@@ -167,6 +168,7 @@ def main(argv=None):
     parser.add_argument("--master-addr", default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29500)
     args = parser.parse_args(argv)
+    args.suite = args.suite or ("qmma" if args.operator == QMMA else "smoke")
     if args.mode == "bench":
         if args.pipes:
             parser.error("bench uses msprof op_summary; pipe selection is only supported by profile")
@@ -186,7 +188,15 @@ def main(argv=None):
         parser.error("multi-node runs require a shared --run-id, shared output filesystem and --nproc-per-node")
     if not 0 <= args.node_rank < args.nnodes:
         parser.error("node-rank outside nnodes")
-    cases = load_cases(args.cases) if args.cases else generate(args.suite, args.seed)
+    if args.cases:
+        cases = load_cases(args.cases)
+    elif args.suite == "qmma":
+        ep_size = 8 if args.ep_size is None else args.ep_size
+        if ep_size not in QMMA_EP_SIZES:
+            parser.error(f"QMMA requires EP in {QMMA_EP_SIZES}")
+        cases = generate("qmma", args.seed, qmma_ep_size=ep_size)
+    else:
+        cases = generate(args.suite, args.seed)
     from .framework.catalog import category, counts
 
     cases = [
@@ -202,6 +212,16 @@ def main(argv=None):
     cases = cases[args.shard_index :: args.shard_count]
     if not cases:
         parser.error("case selection is empty")
+    qmma_selection = [c for c in cases if c.operator == QMMA]
+    if qmma_selection:
+        if args.mode != "accuracy":
+            parser.error("QMMA cases support only accuracy")
+        if (
+            args.bootstrap != "group"
+            or args.nnodes != 1
+            or any(args.nproc_per_node not in (None, c.ep_size) for c in qmma_selection)
+        ):
+            parser.error("QMMA requires one EP group on a single node with group bootstrap")
     if args.mode != "accuracy" and any(c.expected_error for c in cases):
         parser.error("select positive cases for benchmark/profiling")
     if args.mode != "accuracy" and any(
