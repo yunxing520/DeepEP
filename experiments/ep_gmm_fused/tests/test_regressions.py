@@ -14,6 +14,30 @@ import pytest
 COMPONENT = Path(__file__).resolve().parents[1]
 
 
+def test_qmma_plan_and_replay(tmp_path):
+    import json
+
+    from .framework.cases import load_cases
+    from .run import main
+
+    base = ["accuracy", "--operator", "quant_matmul_alltoall", "--dry-run", "--output", str(tmp_path)]
+    assert main([*base, "--run-id", "full", "--ep-size", "4"]) == 0
+    manifest = tmp_path / "full" / "cases.json"
+    cases = load_cases(manifest)
+    assert len(cases) == 50
+    sample = next(case for case in cases if case.format == 2 and case.m == 17)
+    assert (sample.m, sample.n, sample.k, sample.ep_size) == (17, 12288, 4096, 4)
+    assert sample.case_id == "bf16-k4096-small-m17"
+
+    assert main([*base, "--run-id", "replay", "--cases", str(manifest), "--case-id", sample.case_id]) == 0
+    run = tmp_path / "replay"
+    assert load_cases(run / "cases.json") == [sample]
+    plan = json.loads((run / "plan.json").read_text())
+    assert len(plan["selections"]) == len(plan["commands"]) == 1
+    assert plan["selections"][0]["world_size"] == 4
+    assert "--nproc_per_node=4" in plan["commands"][0]
+
+
 @pytest.fixture(scope="module")
 def tiling():
     path = COMPONENT / "python/deep_ep_experimental/ep_gmm_fused/_tiling.py"

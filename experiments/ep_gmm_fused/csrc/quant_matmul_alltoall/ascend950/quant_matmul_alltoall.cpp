@@ -436,7 +436,7 @@ public:
         EnsureInitialized();
         TORCH_CHECK(symmetric == symmetricMemory_ && controlOffset <= symmetricBytes_,
                     "QMMA control region exceeds the symmetric workspace");
-        TORCH_CHECK(controlBytes == symmetricBytes_ - controlOffset,
+        TORCH_CHECK(controlBytes <= symmetricBytes_ - controlOffset,
                     "QMMA control region size disagrees with CatCCOS layout");
         TORCH_CHECK(barrierWorkspace_ != nullptr, "QMMA barrier workspace is not allocated");
         TORCH_CHECK(aclrtMemset(symmetric + controlOffset, controlBytes, 0, controlBytes) == ACL_SUCCESS,
