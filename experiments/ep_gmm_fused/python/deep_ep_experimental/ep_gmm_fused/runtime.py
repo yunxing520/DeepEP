@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Modified by zhu-mingzhe71 2026
-"""EP_GMM_FUSED adapter for the public Session's UDMA communication domain."""
+"""EP_GMM_FUSED adapters for the UDMA and QMMA communication domains."""
 
 import ipaddress
 import os
@@ -29,8 +29,20 @@ class UdmaConfig:
     members: tuple = ()
 
 
+class QmmaConfig:
+    """Process-local QMMA domain; the device kernel and tiling stay in CatCCOS."""
+
+    def __init__(self, rank: int, world_size: int, lanes: int, heap_size: int):
+        self.rank = rank
+        self.world_size = world_size
+        self.lanes = lanes
+        self.heap_size = heap_size
+
+
 _config: Optional[UdmaConfig] = None
 _anchor: Optional[torch.Tensor] = None
+_qmma_config: Optional[QmmaConfig] = None
+_qmma_anchor: Optional[torch.Tensor] = None
 _group_ref = None
 _lock = threading.RLock()
 _leases = 0
@@ -225,3 +237,124 @@ def udma_group(**kwargs) -> Iterator[UdmaConfig]:
             if _leases == 0 and _context_owned:
                 _context_owned = False
                 destroy_udma_group()
+
+
+def _qmma_control_device(group, default_device):
+    backend = str(torch.distributed.get_backend(group)).lower()
+    if backend == "hccl":
+        return default_device
+    if backend == "gloo":
+        return "cpu"
+    raise ValueError(f"QMMA group bootstrap supports HCCL or Gloo, got {backend}")
+
+
+def _require_qmma_native_core():
+    """Load the component module before looking up its registered operators."""
+    core = require_native("EP_GMM_FUSED")
+    importlib.import_module(f"{__package__}._C")
+    return core
+
+
+def init_qmma_group(
+    *,
+    group=None,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+    local_rank: Optional[int] = None,
+    init_method: Optional[str] = None,
+    lanes: int = 1,
+    heap_size: int = 1 << 30,
+) -> QmmaConfig:
+    """Create the CatCCOS QMMA SHMEM domain collectively on its EP ranks."""
+    global _qmma_anchor, _qmma_config
+    if _qmma_config is not None:
+        raise RuntimeError("QMMA group is already initialized")
+    if lanes < 1 or lanes > 4:
+        raise ValueError("lanes must be in [1, 4]")
+    if heap_size <= 0:
+        raise ValueError("heap_size must be positive")
+
+    import torch_npu
+
+    if group is not None:
+        if any(value is not None for value in (rank, world_size, init_method)):
+            raise ValueError("group cannot be combined with rank, world_size or init_method")
+        dist = torch.distributed
+        if not dist.is_initialized():
+            raise RuntimeError("initialize torch.distributed before using group")
+        rank = dist.get_rank(group)
+        world_size = dist.get_world_size(group)
+        local_rank = torch_npu.npu.current_device() if local_rank is None else local_rank
+        device = f"npu:{local_rank}"
+        if init_method is None:
+            init_method = ""
+    else:
+        if rank is None or world_size is None:
+            raise ValueError("rank and world_size are required without a process group")
+        if local_rank is None:
+            local_rank = rank
+
+    if not 0 <= rank < world_size <= 32 or world_size < 2:
+        raise ValueError("QMMA requires 0 <= rank < world_size and 2 <= world_size <= 32")
+    if local_rank < 0:
+        raise ValueError("local_rank must be non-negative")
+    if init_method is None:
+        raise ValueError("init_method is required without a distributed process group")
+    torch_npu.npu.set_device(local_rank)
+    anchor = torch.empty(0, dtype=torch.uint8, device=f"npu:{local_rank}")
+
+    core = _require_qmma_native_core()
+    native = torch.ops.deep_ep_ep_gmm_fused
+    if group is not None:
+        control_device = _qmma_control_device(group, f"npu:{local_rank}")
+        uid_size = native._qmma_unique_id_size()
+        members = tuple(torch.distributed.get_process_group_ranks(group))
+        root = members[0]
+        uid = torch.empty(uid_size, dtype=torch.int32, device=control_device)
+        status = torch.ones(1, dtype=torch.int32, device=control_device)
+        if rank == 0:
+            try:
+                uid.copy_(torch.tensor(native._qmma_unique_id(), dtype=torch.int32, device=control_device))
+            except Exception:
+                status.zero_()
+        torch.distributed.broadcast(status, src=root, group=group)
+        if not bool(status.item()):
+            raise RuntimeError("QMMA root failed to create the SHMEM unique ID")
+        torch.distributed.broadcast(uid, src=root, group=group)
+        unique_id = uid.cpu().tolist()
+        anchor = torch.empty(0, dtype=torch.uint8, device=device)
+    else:
+        unique_id = []
+    if len(init_method.encode("utf-8")) >= 256:
+        raise ValueError("init_method is too long")
+    if core.runtime_busy():
+        raise RuntimeError("A SHMEM runtime already exists in this process")
+    torch_npu.npu.synchronize()
+    try:
+        native._initialize_qmma(anchor, rank, world_size, lanes, heap_size, init_method, unique_id)
+    except Exception:
+        try:
+            native._poison_qmma()
+        except Exception:
+            pass
+        raise
+    _qmma_anchor = anchor
+    _qmma_config = QmmaConfig(rank, world_size, lanes, heap_size)
+    return _qmma_config
+
+
+def destroy_qmma_group() -> None:
+    """Collectively release the QMMA SHMEM domain."""
+    global _qmma_anchor, _qmma_config
+    if _qmma_config is None:
+        return
+    importlib.import_module(f"{__package__}._C")
+    torch.ops.deep_ep_ep_gmm_fused._destroy_qmma(_qmma_anchor)
+    _qmma_anchor = None
+    _qmma_config = None
+
+
+def _get_qmma_config() -> QmmaConfig:
+    if _qmma_config is None:
+        raise RuntimeError("QMMA is not initialized; call init_qmma_group() first")
+    return _qmma_config
