@@ -8,7 +8,7 @@ from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
-from .runtime import get_udma_config
+from .runtime import _get_qmma_config, get_udma_config
 from ._tiling import TILING_FIELDS, validate_tiling
 
 
@@ -367,3 +367,98 @@ def gmm_alltoallv(
 # Descriptive aliases share the callable, signature and return contract.
 all_to_allv_grouped_matmul = alltoallv_gmm
 grouped_matmul_all_to_allv = gmm_alltoallv
+
+
+def _qmma_problem_shape(a: torch.Tensor, b: torch.Tensor, format: int) -> tuple[int, int, int]:
+    if a.dim() != 2 or b.dim() != 2:
+        raise ValueError("a and b must be two-dimensional")
+    if format == 1:
+        if a.shape[1] == 0 or b.shape[1] == 0:
+            raise ValueError("packed MXFP4 tensors must have a non-empty packed width")
+        m, k, n = int(a.shape[0]), int(a.shape[1]) * 2, int(b.shape[1]) * 2
+    else:
+        m, k, n = int(a.shape[0]), int(a.shape[1]), int(b.shape[1])
+    if int(b.shape[0]) != k:
+        raise ValueError("b's first dimension must equal k")
+    return m, n, k
+
+
+def _qmma_check_scale(
+    scale: Optional[torch.Tensor], name: str, expected_shape: tuple[int, ...], device: torch.device
+) -> None:
+    if scale is None:
+        raise ValueError(f"{name} is required for MX inputs")
+    if tuple(scale.shape) != expected_shape:
+        raise ValueError(f"{name} must have shape {expected_shape}, got {tuple(scale.shape)}")
+    if scale.device != device:
+        raise ValueError(f"{name} and the inputs must be on the same NPU")
+    if not scale.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if scale.element_size() != 1:
+        raise ValueError(f"{name} must use one-byte E8M0-compatible physical storage")
+
+
+def quant_matmul_alltoall(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: Optional[torch.Tensor] = None,
+    b_scale: Optional[torch.Tensor] = None,
+    *,
+    format: int,
+    comm_interval: int = 0,
+    lanes: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply local matmul and exchange its N slices with UDMA AllToAll.
+
+    ``format=0`` is MXFP8 with A ``[m,k]`` and B ``[k,n]``. ``format=1`` is
+    packed MXFP4 with A ``[m,k/2]`` and B ``[k,n/2]``. ``format=2`` is BF16.
+    The result is BF16 ``[world_size*m, n/world_size]`` on every rank.
+    """
+    if format not in (0, 1, 2):
+        raise ValueError("format must be 0 (MXFP8), 1 (MXFP4), or 2 (BF16)")
+    if comm_interval < 0:
+        raise ValueError("comm_interval must be non-negative")
+    if not a.is_contiguous() or not b.is_contiguous():
+        raise ValueError("a and b must be contiguous")
+    if a.device != b.device:
+        raise ValueError("a and b must be on the same NPU")
+
+    config = _get_qmma_config()
+    if lanes is not None and lanes != config.lanes:
+        raise ValueError(f"lanes={lanes} differs from the initialized lanes={config.lanes}")
+
+    m, n, k = _qmma_problem_shape(a, b, format)
+    ep_size = config.world_size
+    if k <= 0 or k % 32:
+        raise ValueError("k must be positive and divisible by 32")
+    if n <= 0 or n % ep_size:
+        raise ValueError("n must be positive and divisible by ep_size")
+    q = n // ep_size
+    if q % 256:
+        raise ValueError("n/ep_size must be divisible by 256")
+
+    if format == 2:
+        if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+            raise ValueError("BF16 format requires BF16 a and b")
+        if a_scale is not None or b_scale is not None:
+            raise ValueError("BF16 format does not take MX scales")
+    else:
+        if a.element_size() != 1 or b.element_size() != 1:
+            raise ValueError("MXFP8 and packed MXFP4 inputs must use one-byte physical storage")
+        padded_groups = ((k + 31) // 32 + 1) // 2 * 2
+        _qmma_check_scale(a_scale, "a_scale", (m, padded_groups), a.device)
+        _qmma_check_scale(b_scale, "b_scale", (padded_groups // 2, n, 2), a.device)
+
+    expected_shape = (ep_size * m, q)
+    if out is None:
+        return torch.ops.deep_ep_ep_gmm_fused.quant_matmul_alltoall(
+            a, b, a_scale, b_scale, format, comm_interval, ep_size
+        )
+    if tuple(out.shape) != expected_shape:
+        raise ValueError(f"out must have shape {expected_shape}, got {tuple(out.shape)}")
+    if out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
+        raise ValueError("out must be contiguous BF16 on the same NPU as the inputs")
+    return torch.ops.deep_ep_ep_gmm_fused.quant_matmul_alltoall_out(
+        a, b, a_scale, b_scale, format, comm_interval, ep_size, out
+    )

@@ -1,7 +1,6 @@
 /*
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
-
 #include <ATen/ATen.h>
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
@@ -9,7 +8,10 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 #include "../../tensor_validation.hpp"
-#include "quant_matmul_alltoall_bridge.h"
+#include "catccos/comm/kernel/ascend950_hierarchical_barrier.hpp"
+#include "catccos/dgemm/kernel/ascend950_quant_matmul_alltoall.hpp"
+#include "quant_matmul_alltoall_device.hpp"
+#include <acl/acl.h>
 #include "platform/platform_ascendc.h"
 #include "shmem.h"
 #include "shmem_init.h"
@@ -26,8 +28,153 @@
 #error "EXTENSION_MODULE_NAME must be provided by the EP_GMM_FUSED build"
 #endif
 
+using namespace AscendC;
+
 namespace deepep::ep_gmm_fused {
 namespace {
+struct QmmaLaunchArgs {
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t rank;
+    uint32_t world_size;
+    uint32_t ranks_per_node;
+    uint32_t aic_num;
+    uint32_t comm_interval;
+    uint32_t lane_num;
+    uint32_t epoch;
+    uint32_t format;
+    uint8_t* a;
+    uint8_t* b;
+    uint8_t* a_scale;
+    uint8_t* b_scale;
+    uint8_t* out;
+    uint8_t* symmetric;
+    void* stream;
+    uint64_t ffts_address;
+};
+
+using QmmaBarrier = Catccos::Comm::Kernel::HierarchicalBarrier;
+using QmmaLayout = Catccos::DGemm::Kernel::detail::QuantA2ASymLayout;
+
+uint32_t Rounds(const QmmaLaunchArgs& args)
+{
+    return Catccos::DGemm::Kernel::detail::QuantA2ARoundCount(args.m, args.comm_interval * 128U);
+}
+
+uint32_t Q(const QmmaLaunchArgs& args)
+{
+    return args.n / args.world_size;
+}
+
+uint64_t TxBytes(const QmmaLaunchArgs& args)
+{
+    return QmmaLayout::TxBytes(Rounds(args), args.world_size, args.comm_interval * 128U, Q(args), sizeof(uint16_t));
+}
+
+uint64_t YBytes(const QmmaLaunchArgs& args)
+{
+    return QmmaLayout::YBytes(args.m, args.world_size, Q(args), sizeof(uint16_t));
+}
+
+uint64_t ControlOffset(const QmmaLaunchArgs& args)
+{
+    return TxBytes(args) + YBytes(args);
+}
+
+template <class Config>
+int32_t Launch(const QmmaLaunchArgs& args)
+{
+    using DeviceOp = typename Config::Device;
+    typename DeviceOp::Arguments kernelArgs{
+        Catlass::GemmCoord{args.m, args.n, args.k},
+        args.rank,
+        args.world_size,
+        args.ranks_per_node,
+        args.aic_num,
+        args.comm_interval,
+        args.lane_num,
+        args.epoch,
+        args.a,
+        args.b,
+        args.a_scale,
+        args.b_scale,
+        args.out,
+        args.symmetric,
+    };
+    DeviceOp operation;
+    if (operation.Initialize(kernelArgs) != Catlass::Status::kSuccess) {
+        return 1;
+    }
+    return operation.Run(static_cast<aclrtStream>(args.stream), args.aic_num, args.ffts_address) ==
+                   Catlass::Status::kSuccess
+               ? 0
+               : 2;
+}
+
+uint64_t SymmetricBytes(const QmmaLaunchArgs* args)
+{
+    const uint32_t h = args->comm_interval * 128U;
+    const uint32_t q = args->n / args->world_size;
+    const uint32_t rounds = Catccos::DGemm::Kernel::detail::QuantA2ARoundCount(args->m, h);
+    return QmmaLayout::TotalBytes(rounds, args->world_size, args->m, h, q, sizeof(uint16_t), args->aic_num);
+}
+
+uint64_t OutputOffset(const QmmaLaunchArgs* args)
+{
+    return TxBytes(*args);
+}
+
+uint64_t ControlRegionOffset(const QmmaLaunchArgs* args)
+{
+    return ControlOffset(*args);
+}
+
+uint64_t ControlRegionBytes(const QmmaLaunchArgs* args)
+{
+    return SymmetricBytes(args) - ControlOffset(*args);
+}
+
+int32_t LaunchQuantMatmulAllToAll(const QmmaLaunchArgs* args)
+{
+    if (args->format == 0) {
+        using Config = Ascend950QuantMatmulAllToAllConfigFp8<
+            float8_e4m3_t, Catlass::layout::RowMajor, float8_e4m3_t, Catlass::layout::RowMajor, float8_e8m0_t,
+            Catlass::layout::RowMajor, float8_e8m0_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor>;
+        return Launch<Config>(*args);
+    }
+    if (args->format == 1) {
+        using Config = Ascend950QuantMatmulAllToAllConfigFp4<
+            float4_e2m1x2_t, Catlass::layout::RowMajor, float4_e2m1x2_t, Catlass::layout::RowMajor, float8_e8m0_t,
+            Catlass::layout::RowMajor, float8_e8m0_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor>;
+        return Launch<Config>(*args);
+    }
+    using Config =
+        Ascend950QuantMatmulAllToAllConfigBf16<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t,
+                                               Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor>;
+    return Launch<Config>(*args);
+}
+
+uint64_t BarrierWorkspaceBytes(uint32_t world_size, uint32_t ranks_per_node)
+{
+    const QmmaBarrier::Arguments args{0U, world_size, ranks_per_node, 1U};
+    return QmmaBarrier::GetWorkspaceSize(args);
+}
+
+int32_t LaunchHierarchicalBarrier(uint32_t rank, uint32_t world_size, uint32_t ranks_per_node, uint32_t epoch,
+                                  uint8_t* workspace, void* stream, uint64_t ffts_address)
+{
+    const QmmaBarrier::Arguments args{rank, world_size, ranks_per_node, epoch};
+    const auto params = QmmaBarrier::ToUnderlyingArguments(args, workspace);
+    if (ffts_address == 0) {
+        Catccos::DGemm::Device::KernelAdapter<QmmaBarrier>
+            <<<1, nullptr, static_cast<aclrtStream>(stream)>>>(params, nullptr);
+    } else {
+        Catccos::DGemm::Device::KernelAdapter<QmmaBarrier>
+            <<<1, nullptr, static_cast<aclrtStream>(stream)>>>(params, ffts_address, nullptr);
+    }
+    return aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) == ACL_SUCCESS ? 0 : 3;
+}
 
 constexpr uint32_t kRanksPerNode = 16;
 constexpr uint32_t kMaxWorldSize = 2U * kRanksPerNode;
@@ -295,7 +442,7 @@ public:
         TORCH_CHECK(aclrtMemset(symmetric + controlOffset, controlBytes, 0, controlBytes) == ACL_SUCCESS,
                     "QMMA control-area initialization failed");
         TORCH_CHECK(barrierEpoch_ != std::numeric_limits<uint32_t>::max(), "QMMA barrier epoch exhausted");
-        const int32_t status = qmma_hierarchical_barrier(Rank(), worldSize_, kRanksPerNode, ++barrierEpoch_,
+        const int32_t status = LaunchHierarchicalBarrier(Rank(), worldSize_, kRanksPerNode, ++barrierEpoch_,
                                                          barrierWorkspace_, lastStream_, fftsAddress_);
         TORCH_CHECK(status == 0, "QMMA initial barrier failed: ", status);
     }
@@ -305,7 +452,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitialized();
         TORCH_CHECK(barrierEpoch_ != std::numeric_limits<uint32_t>::max(), "QMMA barrier epoch exhausted");
-        TORCH_CHECK(qmma_hierarchical_barrier(Rank(), WorldSize(), kRanksPerNode, ++barrierEpoch_, barrierWorkspace_,
+        TORCH_CHECK(LaunchHierarchicalBarrier(Rank(), WorldSize(), kRanksPerNode, ++barrierEpoch_, barrierWorkspace_,
                                               lastStream_, fftsAddress_) == 0,
                     "QMMA final barrier failed");
     }
@@ -530,7 +677,7 @@ const char* Validate(uint32_t format, const ProblemShape& shape, uint32_t worldS
         return "invalid comm_interval";
     }
     const QmmaLaunchArgs args = MakeLaunchArgs(shape, format, worldSize, interval, 0, lanes, aicNum, 0);
-    return qmma_symmetric_bytes(&args) <= heapBytes ? nullptr : "shape exceeds heap_size";
+    return SymmetricBytes(&args) <= heapBytes ? nullptr : "shape exceeds heap_size";
 }
 
 void InitializeQmma(const at::Tensor& deviceAnchor, int64_t rank, int64_t worldSize, int64_t lanes, int64_t heapSize,
@@ -599,20 +746,20 @@ at::Tensor QuantMatmulAllToAllImpl(const at::Tensor& a, const at::Tensor& b, con
     TORCH_CHECK(stream != nullptr, "failed to acquire the current NPU stream");
     QmmaLaunchArgs layoutArgs =
         MakeLaunchArgs(shape, format, epSize, interval, runtime.Rank(), runtime.Lanes(), runtime.AicNum(), 0);
-    const uint64_t symmetricBytes = qmma_symmetric_bytes(&layoutArgs);
-    const uint64_t barrierBytes = qmma_barrier_bytes(runtime.WorldSize(), kRanksPerNode);
+    const uint64_t symmetricBytes = SymmetricBytes(&layoutArgs);
+    const uint64_t barrierBytes = BarrierWorkspaceBytes(runtime.WorldSize(), kRanksPerNode);
     runtime.RecordStream(stream);
     uint8_t* symmetric = runtime.EnsureWorkspace(symmetricBytes);
     runtime.EnsureBarrierWorkspace(barrierBytes);
-    runtime.InitializeControl(symmetric, qmma_control_offset(&layoutArgs), qmma_control_bytes(&layoutArgs));
+    runtime.InitializeControl(symmetric, ControlRegionOffset(&layoutArgs), ControlRegionBytes(&layoutArgs));
     QmmaLaunchArgs args = MakeLaunchArgs(
         shape, format, epSize, interval, runtime.Rank(), runtime.Lanes(), runtime.AicNum(), runtime.NextEpoch(),
         symmetric, a.data_ptr(), b.data_ptr(), aScale.has_value() ? aScale->data_ptr() : nullptr,
         bScale.has_value() ? bScale->data_ptr() : nullptr, output.data_ptr(), stream, runtime.FftsAddress());
-    const int32_t status = qmma_launch(&args);
+    const int32_t status = LaunchQuantMatmulAllToAll(&args);
     TORCH_CHECK(status == 0, "CatCCOS QMMA launch failed: ", status);
 
-    const uint64_t outputOffset = qmma_output_offset(&layoutArgs);
+    const uint64_t outputOffset = OutputOffset(&layoutArgs);
     const uint64_t outputBytes = static_cast<uint64_t>(shape.m) * shape.n * sizeof(uint16_t);
     TORCH_CHECK(aclrtMemcpyAsync(output.data_ptr(), outputBytes, symmetric + outputOffset, outputBytes,
                                  ACL_MEMCPY_DEVICE_TO_DEVICE, stream) == ACL_SUCCESS,
