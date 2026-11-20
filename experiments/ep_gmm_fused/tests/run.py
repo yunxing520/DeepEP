@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 from .framework.cases import generate, load_cases, save_cases
-from .framework.qmma_cases import QMMA, QMMA_EP_SIZES
+from .framework.qmma_cases import QMMA, QMMA_EP_SIZES, validate_qmma_topology
 from .performance.metrics import summarize
 
 
@@ -216,12 +216,17 @@ def main(argv=None):
     if qmma_selection:
         if args.mode != "accuracy":
             parser.error("QMMA cases support only accuracy")
-        if (
-            args.bootstrap != "group"
-            or args.nnodes != 1
-            or any(args.nproc_per_node not in (None, c.ep_size) for c in qmma_selection)
-        ):
-            parser.error("QMMA requires one EP group on a single node with group bootstrap")
+        if args.bootstrap != "group":
+            parser.error("QMMA requires group bootstrap")
+        try:
+            for case in qmma_selection:
+                validate_qmma_topology(
+                    ep_size=case.ep_size,
+                    nnodes=args.nnodes,
+                    nproc_per_node=args.nproc_per_node,
+                )
+        except ValueError as error:
+            parser.error(str(error))
     if args.mode != "accuracy" and any(c.expected_error for c in cases):
         parser.error("select positive cases for benchmark/profiling")
     if args.mode != "accuracy" and any(
@@ -301,7 +306,14 @@ def main(argv=None):
         if profiler_config:
             command += ["--profiler-config", str(profiler_config)]
         selections.append(
-            {"case_id": case.case_id, "world_size": world, "category": category(case), "scenario": case.scenario}
+            {
+                "case_id": case.case_id,
+                "world_size": world,
+                "node_count": args.nnodes,
+                "ranks_per_node": nproc,
+                "category": category(case),
+                "scenario": case.scenario,
+            }
         )
         commands.append(command)
     plan = {

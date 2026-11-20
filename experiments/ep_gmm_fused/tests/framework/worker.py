@@ -18,7 +18,7 @@ import time
 
 from .cases import case_from_record
 from .installed import load_installed_ep_gmm_fused
-from .qmma_cases import QMMA, required_symmetric_bytes
+from .qmma_cases import QMMA, required_symmetric_bytes, validate_qmma_topology
 from ..reference.golden import route_matrix
 from ..reference.routing import route_statistics
 from ..reference.streaming import ReferenceStore, check_streaming
@@ -210,8 +210,15 @@ def run_qmma(args, case, package, torch, dist, torch_npu):
     rank, local_rank, size, local_size = (
         int(os.environ[key]) for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
     )
-    if size != case.ep_size or size != local_size:
-        raise ValueError("QMMA tests require one EP group on a single node")
+    if local_size < 1 or size % local_size:
+        raise ValueError("QMMA requires an equal number of ranks on every node")
+    node_count = size // local_size
+    _, _, world_size = validate_qmma_topology(
+        ep_size=case.ep_size,
+        nnodes=node_count,
+        nproc_per_node=local_size,
+    )
+    node_rank = rank // local_size
     heap_size = required_symmetric_bytes(case)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -219,6 +226,11 @@ def run_qmma(args, case, package, torch, dist, torch_npu):
         "case": case.record(),
         "global_rank": rank,
         "ep_rank": rank,
+        "node_rank": node_rank,
+        "node_count": node_count,
+        "ranks_per_node": local_size,
+        "world_size": world_size,
+        "cross_node": node_count > 1,
         "domain": 0,
         "mode": args.mode,
         "accuracy_checked": False,
@@ -228,7 +240,11 @@ def run_qmma(args, case, package, torch, dist, torch_npu):
         torch_npu.npu.set_device(local_rank)
         report["environment"] = environment(torch, torch_npu, package)
         dist.init_process_group("hccl", timeout=timedelta(seconds=args.timeout))
-        package.init_qmma_group(group=dist.group.WORLD, local_rank=local_rank, heap_size=heap_size)
+        package.init_qmma_group(
+            group=dist.group.WORLD,
+            local_rank=local_rank,
+            heap_size=heap_size,
+        )
         inputs, reference = make_qmma_inputs(torch, case, f"npu:{local_rank}", rank, block_rows=args.golden_block_rows)
         result = package.quant_matmul_alltoall(*inputs, format=case.format)
         accuracy = {"passed": True, "backend": "structured-cpu", "comparison": "exact-bf16"}

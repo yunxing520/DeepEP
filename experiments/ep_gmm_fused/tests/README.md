@@ -231,11 +231,26 @@ python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator qu
   --ep-size 8 --case-id bf16-k4096-small-m17
 ```
 
-默认 EP8，可选 EP2/4/16。可用 `--category qmma_mxfp8`、`qmma_mxfp4`、`qmma_bf16_k3328`、
+默认 EP8，可选 EP2/4/8/16/32。EP2/4/8/16 可在单节点执行，也支持双节点 2×2、2×4、2×8；
+EP32 使用双节点 2×16。EP 必须等于 `nnodes × nproc-per-node`。
+可用 `--category qmma_mxfp8`、`qmma_mxfp4`、`qmma_bf16_k3328`、
 `qmma_bf16_large_m` 或 `qmma_bf16_small_m` 选择形状组。case ID 根据格式与形状命名；用
 `--cases <cases.json>` 可重放清单，并用 `--case-id` 筛选单条。
 
-运行设备测试需要安装包含 QMMA 的 `ascend-deepep` wheel 和同节点 Ascend950 设备。
+运行设备测试需要安装包含 QMMA 的 `ascend-deepep` wheel 和 Ascend950 设备。双节点验证还要求
+两节点间 HCCL 与 RoCE 连通，并使用共享输出目录和相同的 `--run-id`。以下命令在两个节点同时执行，
+`NODE_RANK` 分别为 0 和 1；`MASTER_ADDR` 是 rank 0 的地址：
+
+```bash
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
+  --ep-size 32 --nnodes 2 --nproc-per-node 16 --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" --master-port 29500 --run-id qmma-ep32-two-node \
+  --case-id mxfp8-m10000 --output /shared/deepep-validation
+```
+
+双机模式最多支持 2 个节点、32 个 rank，并用相同的 `nproc-per-node` 启动两个节点。验证 2×4 或 2×8 时，
+分别把命令中的 `--ep-size` 和 `--nproc-per-node` 改成 `8/4` 或 `16/8`。worker 会校验节点、每个节点的 rank
+数以及 EP 总规模，并在结果中记录 `node_rank`、`ranks_per_node` 和 `cross_node`。
 默认逐 case 估算 SHMEM heap，并为每条 case 建立独立 torchrun 任务；报告和日志遵循统一的
 `benchmark-runs/ep_gmm_fused/<run-id>/` 目录结构。M=300000 的 MXFP8 EP8 case 还需给
 每卡约 9.2 GiB 对称区和约 7.0 GiB 输入/输出数据预留显存，并给运行时和分配器留余量。
