@@ -78,7 +78,8 @@ def make_qmma_inputs(torch, case: QmmaCase, device: str, rank: int, *, block_row
     return (a, b, a_scale, b_scale), reference
 
 
-def check_qmma_output(torch, output, reference, case: QmmaCase, rank: int, *, block_rows: int) -> None:
+def check_qmma_output(torch, output, reference, case: QmmaCase, rank: int, *, block_rows: int):
+    """Compare exactly; collect relative errors for |expected|>1 and absolute errors for |expected|<1."""
     chunk_n = case.n // case.ep_size
     expected_shape = (case.m * case.ep_size, chunk_n)
     if tuple(output.shape) != expected_shape or output.dtype != torch.bfloat16:
@@ -86,17 +87,52 @@ def check_qmma_output(torch, output, reference, case: QmmaCase, rank: int, *, bl
             f"{case.case_id}: expected BF16 {expected_shape}, got {output.dtype} {tuple(output.shape)}"
         )
     columns = np.arange(rank * chunk_n, (rank + 1) * chunk_n) % COL_PERIOD
+    max_rel = 0.0
+    sum_rel = 0.0
+    count_rel = 0
+    max_abs = 0.0
+    sum_abs = 0.0
+    count_abs = 0
+    mismatch = 0
+    samples = []
     for source in range(case.ep_size):
         base = source * case.m
         for first in range(0, case.m, block_rows):
             stop = min(first + block_rows, case.m)
             expected = reference[np.ix_(_row_indices(first, stop, source), columns)]
             actual = output[base + first : base + stop].cpu().float().numpy()
+            diff = np.abs(actual - expected)
+            pick_rel = np.abs(expected) > 1.0
+            if pick_rel.any():
+                rel = diff[pick_rel] / np.abs(expected[pick_rel])
+                max_rel = max(max_rel, float(rel.max()))
+                sum_rel += float(rel.sum())
+                count_rel += int(rel.size)
+            pick_abs = np.abs(expected) < 1.0
+            if pick_abs.any():
+                part = diff[pick_abs]
+                max_abs = max(max_abs, float(part.max()))
+                sum_abs += float(part.sum())
+                count_abs += int(part.size)
             bad = actual != expected
             if bad.any():
-                row, col = np.unravel_index(bad.argmax(), bad.shape)
-                raise AssertionError(
-                    f"{case.case_id}: destination rank {rank}, source rank {source}, "
-                    f"local GEMM coordinate ({first + row}, {rank * chunk_n + col}): "
-                    f"expected {expected[row, col]}, got {actual[row, col]}"
-                )
+                mismatch += int(bad.sum())
+                if len(samples) < 3:
+                    row, col = np.unravel_index(bad.argmax(), bad.shape)
+                    samples.append(
+                        f"source={source} local=({first + row},{rank * chunk_n + col}) "
+                        f"expected={expected[row, col]} got={actual[row, col]}"
+                    )
+    stats = {
+        "max_relative_error": max_rel,
+        "mean_relative_error": (sum_rel / count_rel) if count_rel else 0.0,
+        "relative_count": count_rel,
+        "max_absolute_error": max_abs,
+        "mean_absolute_error": (sum_abs / count_abs) if count_abs else 0.0,
+        "absolute_count": count_abs,
+        "mismatch_count": mismatch,
+    }
+    failure = ""
+    if mismatch:
+        failure = f"{case.case_id}: {mismatch} element mismatch; " + "; ".join(samples)
+    return stats, failure

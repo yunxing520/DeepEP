@@ -239,27 +239,45 @@ def run_qmma(args, case, package, torch, dist, torch_npu):
     try:
         torch_npu.npu.set_device(local_rank)
         report["environment"] = environment(torch, torch_npu, package)
-        dist.init_process_group("hccl", timeout=timedelta(seconds=args.timeout))
-        package.init_qmma_group(
-            group=dist.group.WORLD,
-            local_rank=local_rank,
-            heap_size=heap_size,
-        )
+        direct_bootstrap = os.environ.get("QMMA_DIRECT_SHMEM", "")
+        report["direct_shmem_bootstrap"] = direct_bootstrap or None
+        if direct_bootstrap:
+            package.init_qmma_group(
+                rank=rank,
+                world_size=size,
+                local_rank=local_rank,
+                init_method=direct_bootstrap,
+                heap_size=heap_size,
+            )
+        else:
+            dist.init_process_group("hccl", timeout=timedelta(seconds=args.timeout))
+            package.init_qmma_group(
+                group=dist.group.WORLD,
+                local_rank=local_rank,
+                heap_size=heap_size,
+            )
         inputs, reference = make_qmma_inputs(torch, case, f"npu:{local_rank}", rank, block_rows=args.golden_block_rows)
         result = package.quant_matmul_alltoall(*inputs, format=case.format)
         accuracy = {"passed": True, "backend": "structured-cpu", "comparison": "exact-bf16"}
         try:
-            check_qmma_output(torch, result, reference, case, rank, block_rows=args.golden_block_rows)
+            stats, failure = check_qmma_output(torch, result, reference, case, rank, block_rows=args.golden_block_rows)
+            accuracy["metrics"] = stats
+            if failure:
+                accuracy.update(passed=False, error=failure)
         except AssertionError as error:
             accuracy.update(passed=False, error=str(error))
         report["accuracy"] = accuracy
         report["accuracy_checked"] = True
-        passed = torch.tensor([int(accuracy["passed"])], dtype=torch.int32, device=f"npu:{local_rank}")
-        dist.all_reduce(passed, op=dist.ReduceOp.MIN)
-        all_ranks_passed = bool(passed.item())
-        # The reduction confirms that every rank has finished accessing its output.
+        if direct_bootstrap:
+            all_ranks_passed = bool(accuracy["passed"])
+        else:
+            passed = torch.tensor([int(accuracy["passed"])], dtype=torch.int32, device=f"npu:{local_rank}")
+            dist.all_reduce(passed, op=dist.ReduceOp.MIN)
+            all_ranks_passed = bool(passed.item())
+        # Destruction synchronizes all SHMEM ranks before freeing the symmetric output.
         package.destroy_qmma_group()
-        dist.destroy_process_group()
+        if not direct_bootstrap:
+            dist.destroy_process_group()
         if not all_ranks_passed:
             raise AssertionError("QMMA output check failed on at least one rank")
         report["passed"] = True

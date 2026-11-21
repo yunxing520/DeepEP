@@ -220,6 +220,8 @@ QMMA 的 [50 个单卡形状](framework/qmma_cases.py)使用同一套 manifest�
 目标只接收其 `N/EP` 列，输出为按源 rank 顺序拼接的 BF16 `[EP*M,N/EP]`。
 覆盖 MXFP8、MXFP4 各 10 条，BF16 的 K=3328 大 M、K=4096 大 M 和小 M 各 10 条。
 结构化输入按行、列和 K 分组变化；测试用 CPU 参考逐块精确比较 BF16 输出，检查量化 scale、源 rank 顺序和列切片。
+各 rank 报告的 `accuracy.metrics` 保存不匹配元素数，以及 `|expected|>1` 的相对误差、
+`|expected|<1` 的绝对误差的最大值、均值和统计数量；通过条件仍是所有元素精确相等。
 
 ```bash
 # 只生成用例、manifest 和执行计划，无需 NPU
@@ -230,6 +232,11 @@ python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator qu
 python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
   --ep-size 8 --case-id bf16-k4096-small-m17
 ```
+
+默认通过 HCCL 进程组交换 SHMEM unique ID。设置 `QMMA_DIRECT_SHMEM=<rank0-IP>:<独立端口>`
+可改用 SHMEM 直接初始化；所有 rank 使用相同地址，端口需与 torchrun 的 `--master-port` 不同。
+启动命令仍使用 torchrun，QMMA worker 不再创建 HCCL 进程组；各 rank 独立判定精度，
+销毁 QMMA 组时执行跨 rank 同步，最终报告仍要求所有 rank 通过。
 
 默认 EP8，可选 EP2/4/8/16/32。EP2/4/8/16 可在单节点执行，也支持双节点 2×2、2×4、2×8；
 EP32 使用双节点 2×16。EP 必须等于 `nnodes × nproc-per-node`。
