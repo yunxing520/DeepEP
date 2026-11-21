@@ -414,6 +414,10 @@ def build_configuration(environment=None):
             torch_npu=torch_npu.__version__,
             torch_cxx11_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI),
             shmem_revision=lock["shmem"]["revision"],
+            qmma={
+                "CATCCOS_HIERARCHICAL_GROUP_SIZE": env.get("CATCCOS_HIERARCHICAL_GROUP_SIZE", "16"),
+                "ENABLE_TIMER": "ON" if enabled("ENABLE_TIMER", env) else "OFF",
+            },
         )
         source = Path(env.get("SHMEM_SOURCE_PATH", ROOT / "third-party/shmem"))
         result["ep_gmm_fused_paths"] = {
@@ -543,6 +547,7 @@ class CMakeBuild(build_ext):
                     f"-DPython3_EXECUTABLE={sys.executable}",
                     f"-DDEEPEP_EXTENSION_SUFFIX={sysconfig.get_config_var('EXT_SUFFIX')}",
                     *(f"-D{name}={value}" for name, value in configuration["ep_gmm_fused_paths"].items()),
+                    *(f"-D{name}={value}" for name, value in configuration["ep_gmm_fused"]["qmma"].items()),
                 ]
             )
         checked_run(arguments)

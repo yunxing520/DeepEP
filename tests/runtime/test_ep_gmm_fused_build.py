@@ -106,6 +106,10 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     }
     if ep_gmm_fused:
         configuration["ep_gmm_fused_paths"] = {"SHMEM_SOURCE_PATH": "/private/shmem"}
+        configuration["ep_gmm_fused"]["qmma"] = {
+            "CATCCOS_HIERARCHICAL_GROUP_SIZE": "8",
+            "ENABLE_TIMER": "ON",
+        }
     monkeypatch.setattr(build, "build_configuration", lambda: configuration)
     monkeypatch.setenv("MAX_JOBS", max_jobs)
     if cmake_jobs is None:
@@ -156,6 +160,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     assert f"-DDEEPEP_DEVICE_JOBS={expected_jobs}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}" in calls[0]
+    assert ("-DCATCCOS_HIERARCHICAL_GROUP_SIZE=8" in calls[0]) is ep_gmm_fused
+    assert ("-DENABLE_TIMER=ON" in calls[0]) is ep_gmm_fused
     assert calls[1][-2:] == ["--parallel", expected_jobs]
     assert not (destination / "libdeepep_notify.so").exists()
     assert all(not (destination / name).exists() for name in obsolete_modules)
@@ -172,6 +178,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
         component_info = json.loads((component / "_build_info.json").read_text())
         assert component_info["upstream"] == upstream["commit"]
         assert component_info["enabled"] is True
+        assert component_info["qmma"] == info["ep_gmm_fused"]["qmma"] == configuration["ep_gmm_fused"]["qmma"]
 
 
 @pytest.mark.parametrize("ep_gmm_fused", [False, True])
@@ -418,6 +425,33 @@ def test_lineinfo_only_affects_component_builds(build, sdk_environment, ep_gmm_f
         configuration = build.build_configuration(env)
         assert configuration["build_type"] == expected
         assert configuration["ep_gmm_fused"]["lineinfo"] is (ep_gmm_fused and lineinfo == "ON")
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, {"CATCCOS_HIERARCHICAL_GROUP_SIZE": "16", "ENABLE_TIMER": "OFF"}),
+        ({"CATCCOS_HIERARCHICAL_GROUP_SIZE": "4"}, {"CATCCOS_HIERARCHICAL_GROUP_SIZE": "4", "ENABLE_TIMER": "OFF"}),
+        ({"CATCCOS_HIERARCHICAL_GROUP_SIZE": "8", "ENABLE_TIMER": "ON"},
+         {"CATCCOS_HIERARCHICAL_GROUP_SIZE": "8", "ENABLE_TIMER": "ON"}),
+        ({"ENABLE_TIMER": "1"}, {"CATCCOS_HIERARCHICAL_GROUP_SIZE": "16", "ENABLE_TIMER": "ON"}),
+    ],
+)
+def test_qmma_options_are_forwarded_and_invalidate_cache(build, sdk_environment, overrides, expected):
+    env = {**sdk_environment, "DEEPEP_BUILD_EP_GMM_FUSED": "ON"}
+    baseline = build.build_configuration(env)
+    configured = build.build_configuration({**env, **overrides})
+    assert configured["ep_gmm_fused"]["qmma"] == expected
+    assert (build.build_cache_key(configured) != build.build_cache_key(baseline)) is bool(overrides)
+
+
+def test_qmma_options_are_ignored_by_core_builds(build, sdk_environment):
+    baseline = build.build_configuration(sdk_environment)
+    configured = build.build_configuration({
+        **sdk_environment, "CATCCOS_HIERARCHICAL_GROUP_SIZE": "invalid", "ENABLE_TIMER": "invalid"
+    })
+    assert "qmma" not in configured["ep_gmm_fused"]
+    assert build.build_cache_key(configured) == build.build_cache_key(baseline)
 
 
 @pytest.mark.parametrize("component", ["ep_gmm_fused", "other", "nested"])

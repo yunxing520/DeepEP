@@ -42,6 +42,26 @@ DEEPEP_BUILD_EP_GMM_FUSED=ON python -m build --wheel --no-isolation
 python -m pip install --force-reinstall --no-deps dist/实际文件名.whl
 ```
 
+QMMA 支持以下构建参数；wheel 构建通过同名环境变量传入，直接使用 CMake 时通过 `-D` 传入：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CATCCOS_HIERARCHICAL_GROUP_SIZE` | `16` | 每个 UDMA 域的连续 rank 数，编译取值 `1..32`。跨机时须与每节点 rank 数一致，双机 `2x4/2x8/2x16` 分别设置 `4/8/16`。 |
+| `ENABLE_TIMER` | `OFF` | `ON/OFF`，仅为 QMMA 开启 CatCCOS AscendTimer 打点和 CSV 导出。 |
+
+例如，构建每节点 8 卡并开启 QMMA 计时的 wheel：
+
+```bash
+DEEPEP_BUILD_EP_GMM_FUSED=ON CATCCOS_HIERARCHICAL_GROUP_SIZE=8 ENABLE_TIMER=ON \
+  python -m build --wheel --no-isolation
+```
+
+直接配置 CMake 时，在原有命令后追加 `-DCATCCOS_HIERARCHICAL_GROUP_SIZE=8 -DENABLE_TIMER=ON`。
+这两项会记录在构建信息中，修改任一项会使用不同的原生构建缓存。
+QMMA 的 Host 拓扑判断、barrier 和 Device 调度使用相同的分组大小；仍最多双机、总计 32 rank。
+计时开启后，运行算子时 CSV 写入当前工作目录的 `output_timer/`，原始时间线位于其 `data/` 子目录。
+RDMA 后端和 doorbell 模式继续沿用共用 SHMEM SDK 的设置。
+
 更新代码后重新编译，再安装生成的 wheel，无需先卸载。
 查询安装用 `python -m pip show ascend-deepep`，卸载用 `python -m pip uninstall ascend-deepep`。
 请先激活目标 Conda/venv；使用本次生成的实际 wheel 文件名，避免通配符选中多个旧版本。

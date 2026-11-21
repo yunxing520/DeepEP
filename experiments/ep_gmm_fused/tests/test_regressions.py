@@ -101,7 +101,8 @@ def test_qmma_ep32_uses_aligned_quantized_cases():
 
 
 @pytest.mark.parametrize("doorbell_mode", [0, 1])
-def test_qmma_uses_core_sdk_rdma_settings(tmp_path, doorbell_mode):
+@pytest.mark.parametrize("group_size,timer", [(None, None), ("4", "OFF"), ("8", "ON"), ("16", "ON"), ("32", "OFF")])
+def test_qmma_build_options_and_sdk_settings(tmp_path, doorbell_mode, group_size, timer):
     cmake = shutil.which("cmake")
     if cmake is None:
         pytest.skip("CMake required for QMMA SDK configuration validation")
@@ -112,19 +113,54 @@ set(DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP {doorbell_mode})
 function(add_sources flags)
     foreach(required IN ITEMS
             -DCATCCOS_SHMEM_WITH_QP=1
+            -DCATCCOS_HIERARCHICAL_GROUP_SIZE={group_size or '16'}
             -DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1
             -DACLSHMEMI_HNS_1825_PI_ON_CHIP={doorbell_mode})
         if(NOT required IN_LIST COMPILE_OPTIONS)
             message(FATAL_ERROR "Missing SDK compile option: ${{required}}")
         endif()
     endforeach()
+    if({timer or 'OFF'})
+        if(NOT "-DENABLE_TIMER" IN_LIST COMPILE_OPTIONS)
+            message(FATAL_ERROR "Missing QMMA timer instrumentation")
+        endif()
+    elseif("-DENABLE_TIMER" IN_LIST COMPILE_OPTIONS)
+        message(FATAL_ERROR "QMMA timer enabled in an OFF build")
+    endif()
 endfunction()
 include("{(COMPONENT / 'csrc/quant_matmul_alltoall/ascend950/CMakeLists.txt').as_posix()}")
 """,
         encoding="utf-8",
     )
-    result = subprocess.run([cmake, "-P", str(script)], capture_output=True, text=True, timeout=30)
+    arguments = [cmake]
+    if group_size is not None:
+        arguments.append(f"-DCATCCOS_HIERARCHICAL_GROUP_SIZE={group_size}")
+    if timer is not None:
+        arguments.append(f"-DENABLE_TIMER={timer}")
+    result = subprocess.run([*arguments, "-P", str(script)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("group_size", ["0", "33", "-1", "8;16", "invalid"])
+def test_qmma_rejects_invalid_build_group_size(tmp_path, group_size):
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("CMake required for QMMA configuration validation")
+    script = tmp_path / "qmma-invalid-group.cmake"
+    script.write_text(
+        f"""cmake_minimum_required(VERSION 3.19)
+function(add_sources flags)
+endfunction()
+include("{(COMPONENT / 'csrc/quant_matmul_alltoall/ascend950/CMakeLists.txt').as_posix()}")
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [cmake, f"-DCATCCOS_HIERARCHICAL_GROUP_SIZE={group_size}", "-P", str(script)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "CATCCOS_HIERARCHICAL_GROUP_SIZE must be in [1, 32]" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

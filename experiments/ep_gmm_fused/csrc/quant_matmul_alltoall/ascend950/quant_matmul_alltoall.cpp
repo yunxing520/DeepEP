@@ -176,8 +176,8 @@ int32_t LaunchHierarchicalBarrier(uint32_t rank, uint32_t world_size, uint32_t r
     return aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) == ACL_SUCCESS ? 0 : 3;
 }
 
-constexpr uint32_t kRanksPerNode = 16;
-constexpr uint32_t kMaxWorldSize = 2U * kRanksPerNode;
+constexpr uint32_t kRanksPerNode = CATCCOS_HIERARCHICAL_GROUP_SIZE;
+constexpr uint32_t kMaxWorldSize = std::min(32U, 2U * kRanksPerNode);
 constexpr uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr uint64_t kHeapAlignment = 2ULL * kMiB;
 constexpr uint64_t kHeapReserve = 16ULL * kMiB;
@@ -598,7 +598,7 @@ uint32_t CheckedUint32(int64_t value, const char* name)
 ProblemShape InferShape(const at::Tensor& a, const at::Tensor& b, int64_t format, int64_t epSize)
 {
     TORCH_CHECK(format >= 0 && format <= 2, "format must be 0 (MXFP8), 1 (MXFP4), or 2 (BF16)");
-    TORCH_CHECK(epSize >= 2 && epSize <= kMaxWorldSize, "ep_size must be in [2, 32]");
+    TORCH_CHECK(epSize >= 2 && epSize <= kMaxWorldSize, "ep_size must be in [2, ", kMaxWorldSize, "]");
     TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a and b must be two-dimensional");
     TORCH_CHECK(a.size(1) > 0 && b.size(1) > 0, "packed input widths must be positive");
     const int64_t k = format == 1 ? a.size(1) * 2 : a.size(1);
