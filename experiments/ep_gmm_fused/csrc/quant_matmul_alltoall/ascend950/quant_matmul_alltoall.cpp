@@ -505,8 +505,7 @@ private:
         attributes.option_attr.shm_init_timeout = kDefaultTimeout;
         attributes.option_attr.shm_create_timeout = kDefaultTimeout;
         attributes.option_attr.control_operation_timeout = kDefaultTimeout;
-        TORCH_CHECK(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false) == ACLSHMEM_SUCCESS,
-                    "failed to configure QMMA shared-jetty mode");
+        attributes.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
         runtimeStarted_ = true;
         TORCH_CHECK(aclshmemx_init_attr(mode, &attributes) == ACLSHMEM_SUCCESS, "QMMA SHMEM initialization failed");
         fftsAddress_ = shmemx_get_ffts_config();

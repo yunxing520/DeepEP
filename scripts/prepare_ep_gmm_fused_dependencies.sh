@@ -67,6 +67,7 @@ DEFAULT_SDK_DIR=$(realpath -m -- "${DEFAULT_SDK_DIR}")
 if [[ -e "${SDK_DIR}/deepep-sdk.json" ]]; then
     # Never silently rebuild or relabel a mismatched SDK.
     "${PYTHON}" "${SCRIPT_DIR}/record_shmem_sdk.py" --sdk "${SDK_DIR}" --check
+    "${PYTHON}" "${SCRIPT_DIR}/shmem_sdk_identity.py" "${SDK_DIR}"
     echo "Reusing verified SHMEM SDK: ${SDK_DIR}"
 elif [[ "${SDK_DIR}" != "${DEFAULT_SDK_DIR}" ]]; then
     echo "error: SHMEM_ROOT=${SDK_DIR} has no deepep-sdk.json; provide a recorded SDK or unset SHMEM_ROOT to build ${DEFAULT_SDK_DIR}" >&2
@@ -80,7 +81,7 @@ else
     (
         cd -- "${SHMEM_DIR}"
         # The upstream script does not enable errexit itself.
-        bash -e -o pipefail scripts/build.sh -soc_type Ascend950
+        bash -e -o pipefail scripts/build.sh -soc_type Ascend950 -enable_rdma -rdma_backend HNS_1825
     )
     # Only attest a successful build from the clean, locked source tree.
     ACTUAL_SHMEM_COMMIT=$(git -C "${SHMEM_DIR}" rev-parse HEAD)
@@ -89,7 +90,27 @@ else
         echo "error: SHMEM source changed during the build; SDK identity was not recorded" >&2
         exit 1
     fi
-    "${PYTHON}" "${SCRIPT_DIR}/record_shmem_sdk.py" --sdk "${SDK_DIR}" --revision "${SHMEM_COMMIT}"
+    PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "${PYTHON}" - \
+        "${SDK_DIR}" "${SHMEM_COMMIT}" "${SHMEM_DIR}" "${REPO_ROOT}/dependencies.lock.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+from build_shmem import cann_version, rdma_build_mode
+from record_shmem_sdk import record
+
+sdk, revision, source, lock_path = sys.argv[1:]
+lock = json.loads(Path(lock_path).read_text())
+version = cann_version(lock["cann_version"])
+record(sdk, revision, build_info={
+    "cann_version": version["Version"],
+    "cann_timestamp": version.get("timestamp", "unknown"),
+    "target": lock["target"],
+    "source_patches": [],
+    "rdma_backend": "HNS_1825",
+    "hns_1825_pi_on_chip": rdma_build_mode(Path(source)),
+})
+PY
     "${PYTHON}" "${SCRIPT_DIR}/record_shmem_sdk.py" --sdk "${SDK_DIR}" --check
 fi
 

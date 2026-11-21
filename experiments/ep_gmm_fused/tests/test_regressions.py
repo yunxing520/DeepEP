@@ -97,7 +97,34 @@ def test_qmma_ep32_uses_aligned_quantized_cases():
     cases = qmma_cases(seed=1, ep_size=32)
     assert cases
     assert all(case.n % (256 * case.ep_size) == 0 for case in cases)
-    assert all(case.format in {"mxfp8", "mxfp4"} for case in cases)
+    assert all(case.format in {0, 1} for case in cases)
+
+
+@pytest.mark.parametrize("doorbell_mode", [0, 1])
+def test_qmma_uses_core_sdk_rdma_settings(tmp_path, doorbell_mode):
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("CMake required for QMMA SDK configuration validation")
+    script = tmp_path / "qmma-sdk.cmake"
+    script.write_text(
+        f"""cmake_minimum_required(VERSION 3.19)
+set(DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP {doorbell_mode})
+function(add_sources flags)
+    foreach(required IN ITEMS
+            -DCATCCOS_SHMEM_WITH_QP=1
+            -DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1
+            -DACLSHMEMI_HNS_1825_PI_ON_CHIP={doorbell_mode})
+        if(NOT required IN_LIST COMPILE_OPTIONS)
+            message(FATAL_ERROR "Missing SDK compile option: ${{required}}")
+        endif()
+    endforeach()
+endfunction()
+include("{(COMPONENT / 'csrc/quant_matmul_alltoall/ascend950/CMakeLists.txt').as_posix()}")
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run([cmake, "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

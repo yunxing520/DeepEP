@@ -4,6 +4,6 @@
 
 CATCCOS_COMMIT = "58754e4efbfe922edafd1d933245c95f0ebb895d"
 # The external SDK and device headers share the repository's dependency lock.
-SHMEM_VERSION = "1.7.0"
-SHMEM_REF = "2057780fe2b8a9d7cd97d5d60b3230493b235cfa"
+SHMEM_VERSION = "1.8.0"
+SHMEM_REF = "b41a8fa560b03ddfd9001052cd6002c6a28de809"
 SHMEM_COMMIT = SHMEM_REF
