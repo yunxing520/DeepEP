@@ -262,6 +262,129 @@ python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator qu
 `benchmark-runs/ep_gmm_fused/<run-id>/` 目录结构。M=300000 的 MXFP8 EP8 case 还需给
 每卡约 9.2 GiB 对称区和约 7.0 GiB 输入/输出数据预留显存，并给运行时和分配器留余量。
 
+### QMMA 操作指南
+
+以下命令均从 DeepEP 仓库根目录执行。`--dry-run` 只生成计划，无需安装 wheel 或配置 NPU。
+
+#### 编译和安装
+
+激活已安装匹配 PyTorch/torch_npu 的 Python 环境，加载 CANN 9.2.0 或更新版本：
+
+```bash
+cd /path/to/DeepEP
+source /path/to/cann/set_env.sh
+export PYTHON=python
+export CMAKE_BUILD_PARALLEL_LEVEL=4
+python -m pip install -r requirements-build.txt -r experiments/ep_gmm_fused/tests/requirements.txt
+git submodule update --init --recursive -- third-party/shmem
+bash scripts/prepare_ep_gmm_fused_dependencies.sh
+# 在当前终端执行依赖准备脚本输出的 export 命令。
+
+# 构建适用于双机 2x8 的 wheel；默认 ENABLE_TIMER=OFF。
+DEEPEP_NPU_ARCH=Ascend950 DEEPEP_BUILD_EP_GMM_FUSED=ON \
+  CATCCOS_HIERARCHICAL_GROUP_SIZE=8 ENABLE_TIMER=OFF \
+  python -m build --wheel --no-isolation --outdir dist/qmma-g8
+
+# 使用构建日志中实际生成的文件名，在每个节点的目标 Python 环境执行。
+python -m pip install --force-reinstall --no-deps dist/qmma-g8/实际文件名.whl
+```
+
+上述命令编译整个 DeepEP wheel，包括核心扩展和三个实验算子。
+如已指定 `CATCCOS_SOURCE_PATH`、`SHMEM_SOURCE_PATH` 或 `SHMEM_ROOT`，复用这些路径并执行现有版本校验。
+同一个共享 checkout 只在一个节点编译，其他节点安装同一个 wheel。
+
+| 运行拓扑 | 编译 group size | EP | 说明 |
+| --- | ---: | ---: | --- |
+| 单机 2/4/8/16 卡 | 不小于实际卡数，默认 16 可覆盖 | 2/4/8/16 | 同机 peer 使用 UDMA |
+| 双机 2×4 | 4 | 8 | 同机 UDMA，跨机 RoCE/RDMA |
+| 双机 2×8 | 8 | 16 | 同机 UDMA，跨机 RoCE/RDMA |
+| 双机 2×16 | 16 | 32 | 同机 UDMA，跨机 RoCE/RDMA |
+
+`CATCCOS_HIERARCHICAL_GROUP_SIZE` 是编译参数，双机必须等于每节点进程数。
+例如，默认 group size=16 的 wheel 用于 2×8 时，`world_size=16` 会被判为单机并只启用 UDMA。
+修改运行时环境变量不会改变已安装 wheel；需要按目标 group size 重新编译并安装。
+编译时设置 `ENABLE_TIMER=ON` 可开启 QMMA 打点，计时数据写到运行工作目录的 `output_timer/`。
+
+#### 单机执行
+
+在目标节点加载 CANN 环境并安装 wheel 后，先运行一条用例，再扩大到全部形状：
+
+```bash
+# 单机 8 卡，先确认计划；删掉 --dry-run 后执行。
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
+  --ep-size 8 --nproc-per-node 8 --case-id mxfp8-m10000 --timeout 1800 --dry-run
+
+# 全部 50 条；也可加 --category qmma_bf16_small_m 等分类筛选。
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
+  --ep-size 8 --nproc-per-node 8 --timeout 1800
+```
+
+每个进程使用逻辑设备 `LOCAL_RANK`。选卡时可在启动前设置
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`，可见卡数须覆盖本机进程数。
+验证单机 4 卡或 16 卡时，将 `--ep-size` 和 `--nproc-per-node` 都设为实际卡数，使用 group size 足够的 wheel。
+
+#### 双机执行
+
+两个节点使用相同代码、Python/框架环境和同一个 wheel；加载各自 CANN 环境。
+`/shared/deepep-validation` 必须是两节点都能读写的同一共享目录，且具有相同绝对路径。
+两个独立本地目录即使名字相同也不能替代共享目录。每次运行使用新的 run ID，
+两节点的 case 筛选、seed、端口及其他测试参数保持一致，并在超时前启动两端。
+
+下面以 2×8 为例，将 `192.0.2.10` 替换为节点 0 可达的真实 IP：
+
+```bash
+# 节点 0
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
+  --ep-size 16 --nnodes 2 --nproc-per-node 8 --node-rank 0 --master-addr 192.0.2.10 \
+  --run-id qmma-2x8-first --output /shared/deepep-validation \
+  --case-id mxfp8-m10000 --timeout 1800
+```
+
+```bash
+# 节点 1；run ID 和输出目录与节点 0 完全一致。
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite qmma --operator quant_matmul_alltoall \
+  --ep-size 16 --nnodes 2 --nproc-per-node 8 --node-rank 1 --master-addr 192.0.2.10 \
+  --run-id qmma-2x8-first --output /shared/deepep-validation \
+  --case-id mxfp8-m10000 --timeout 1800
+```
+
+2×4、2×16 分别将 `--ep-size` 和 `--nproc-per-node` 改为 8/4、32/16，并安装 group size=4、16 的 wheel；
+其他启动约定相同。加 `--dry-run` 可检查计划，生成的 run ID 会占用，实际执行时换一个新 ID。
+默认 torchrun 使用端口 29500，可在两节点的命令中同时加上 `--master-port 29510`。
+各 EP 档默认执行 50 条用例，其中 MXFP8 和 MXFP4 各 10 条，BF16 有 30 条。
+BF16 的 `N/EP` 按 128 列对齐，MXFP8/MXFP4 按 256 列对齐。EP32 的 BF16 用例每个目标 rank 接收 384 列。
+
+#### 建链排查和结果
+
+默认顺序为 torchrun TCP rendezvous、HCCL 进程组/UID 广播、SHMEM UDMA+RoCE 初始化，再执行 QMMA。
+torchrun 的 `MASTER_ADDR/MASTER_PORT` 用于控制通信，不是 RDMA 网卡/IP 的配置。
+RoCE 路径还取决于所选 NPU 的网卡亲和、设备拓扑和 RDMA 网络可达性。
+
+两节点可同时设置以下变量，再执行各自的双机启动命令，单独排查 SHMEM 初始化路径：
+
+```bash
+export SHMEM_LOG_LEVEL=INFO
+export SHMEM_LOG_TO_STDOUT=1
+export QMMA_DIRECT_SHMEM=192.0.2.10:29601
+# 使用新的共同 run ID。
+```
+
+该模式保留 torchrun 启动，但跳过 HCCL 进程组及 UID 广播，改用独立 TCP endpoint 初始化 SHMEM；
+29601 必须与 torchrun 端口不同，且两节点能互通。它不会绕过 UDMA/RoCE 建链。
+默认路径需要 HCCL 和 RoCE 都正常；直接 SHMEM 路径可用于区分 HCCL 初始化问题和 SHMEM 建链问题。
+该框架目前只支持 QMMA 的 `accuracy`，不支持 `bench/profile`。
+
+结果保存在 `<output>/<run-id>/`：每个 case 的 `worker-node-0.log`、`worker-node-1.log` 是两节点日志，
+`rank-*.json` 记录各 rank 的精度结果、包路径和构建参数。失败时先查看最早的底层报错。
+两节点结束后可重新汇总共享目录：
+
+```bash
+python -m experiments.ep_gmm_fused.tests.run report \
+  --output /shared/deepep-validation/qmma-2x8-first
+```
+
+`summary.json` 的 `passed=true` 才表示所有预期 rank 均报告通过。编译成功和 dry-run 成功均不代表设备验证通过。
+
 ## 性能
 
 ```bash

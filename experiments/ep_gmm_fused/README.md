@@ -5,8 +5,9 @@ Modified by Joyce_An 2026
 
 # EpGmmFused Beta
 
-Ascend950 上的两个 BF16 通算融合算子：`alltoallv_gmm`（AllToAllV → GMM）和
-`gmm_alltoallv`（GMM → AllToAllV）。
+Ascend950 上的通算融合算子：`alltoallv_gmm`（AllToAllV → GMM）、
+`gmm_alltoallv`（GMM → AllToAllV）和 `quant_matmul_alltoall`（QMMA，支持 MXFP8/MXFP4/BF16）。
+QMMA 的编译、单机和双机启动步骤见[操作指南](tests/README.md#qmma-操作指南)。
 
 本目录包含内核、Host、Python API 和设备验证工具。根构建按 `DEEPEP_BUILD_EP_GMM_FUSED`
 选择完整实验单元。Linux/CANN 原生构建、
@@ -15,14 +16,15 @@ Ascend950 精度、性能和流水采集仍需实机验收。核心 `deep_ep` �
 
 ```text
 ep_gmm_fused/
-├── csrc/                    # 两个算子的 Host/Device、工作区、CatCCOS overlay
+├── csrc/                    # 算子的 Host/Device、工作区、CatCCOS overlay
 ├── python/deep_ep_experimental/ep_gmm_fused/
 ├── tests/                   # 精度泛化、性能、采集
 └── CMakeLists.txt           # 根 CMake 的可选子单元
 ```
 
-SHMEM 的初始化、内部对称工作区和销毁复用根 `csrc/runtime/session.hpp/.cpp` 的可选 UDMA 入口。
-本模块借用固定 `400 MiB + 4 KiB` 工作区，负责算子布局和实际执行流同步。产品包不依赖测试目录。
+两个 GMM 算子的 SHMEM 初始化、内部对称工作区和销毁复用根 `csrc/runtime/session.hpp/.cpp` 的可选 UDMA 入口，
+借用固定 `400 MiB + 4 KiB` 工作区。QMMA 使用独立的初始化入口，按形状分配对称工作区，
+并在跨机时启用 UDMA 与 RoCE。产品包不依赖测试目录。
 
 ## 构建
 
@@ -34,6 +36,7 @@ Host 编译器与核心 runtime 的通用要求见[根构建指南](../../docs/b
 source /path/to/ascend-toolkit/set_env.sh
 export DEEPEP_NPU_ARCH=Ascend950
 python -m pip install -r requirements-build.txt -r requirements-dev.txt
+git submodule update --init --recursive -- third-party/shmem
 bash scripts/prepare_ep_gmm_fused_dependencies.sh
 # 将脚本末尾输出的 export 命令复制到当前终端，再执行：
 # 编译打包
@@ -82,7 +85,7 @@ fi
 `python -m pip show ascend-deepep` 与 `python -I -m pip show ascend-deepep`；
 后者忽略当前目录、`PYTHONPATH` 和用户级包目录，不作为日常必需参数。
 
-根构建固定 CatCCOS `878c2e0a504be8c49c03b5e1157a7c714a628e29`、其 CATLASS gitlink，
+根构建固定 CatCCOS `58754e4efbfe922edafd1d933245c95f0ebb895d`、其 CATLASS gitlink，
 SHMEM 沿用主线 [dependencies.lock.json](../../dependencies.lock.json) 固定的提交。
 `SHMEM_SOURCE_PATH` 为同一提交的干净源码，提供 device 私有头；`SHMEM_ROOT` 为已记录身份的外部 SDK。
 `CATCCOS_SOURCE_PATH` 可显式指定；提交不匹配、源码脏或子模块不匹配时停止。
@@ -91,7 +94,7 @@ SHMEM 沿用主线 [dependencies.lock.json](../../dependencies.lock.json) 固定
 成功后调用 `scripts/record_shmem_sdk.py` 记录身份；已有 manifest 不匹配时停止，不自动改写身份。
 可用 `python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" --check` 单独校验。
 默认安装目录为 `${SHMEM_SOURCE_PATH}/install/shmem`；显式指定其他 SDK 路径时只校验，不覆盖。
-版本、头文件或哈希不匹配会报错；安装包不携带另一套 SHMEM/memfabric 动态库。
+版本、头文件或哈希不匹配会报错；wheel 使用主线统一打包的 SHMEM 运行库，详见[根构建指南](../../docs/build.md)。
 准备脚本最后输出 `export` 命令，须复制到当前终端执行；可用 `PYTHON` 指定该脚本的解释器。
 
 仅开启本模块时，`DEEPEP_LINEINFO=ON` 默认选择 RelWithDebInfo 以支持指令 PC/源码映射；

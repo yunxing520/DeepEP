@@ -41,6 +41,7 @@ struct QmmaLaunchArgs {
     uint32_t ranks_per_node;
     uint32_t aic_num;
     uint32_t comm_interval;
+    uint32_t tile_m;
     uint32_t lane_num;
     uint32_t epoch;
     uint32_t format;
@@ -57,9 +58,14 @@ struct QmmaLaunchArgs {
 using QmmaBarrier = Catccos::Comm::Kernel::HierarchicalBarrier;
 using QmmaLayout = Catccos::DGemm::Kernel::detail::QuantA2ASymLayout;
 
+uint32_t TileM(const QmmaLaunchArgs& args)
+{
+    return args.tile_m;
+}
+
 uint32_t Rounds(const QmmaLaunchArgs& args)
 {
-    return Catccos::DGemm::Kernel::detail::QuantA2ARoundCount(args.m, args.comm_interval * 128U);
+    return Catccos::DGemm::Kernel::detail::QuantA2ARoundCount(args.m, args.comm_interval * TileM(args));
 }
 
 uint32_t Q(const QmmaLaunchArgs& args)
@@ -69,7 +75,7 @@ uint32_t Q(const QmmaLaunchArgs& args)
 
 uint64_t TxBytes(const QmmaLaunchArgs& args)
 {
-    return QmmaLayout::TxBytes(Rounds(args), args.world_size, args.comm_interval * 128U, Q(args), sizeof(uint16_t));
+    return QmmaLayout::TxBytes(Rounds(args), args.world_size, args.comm_interval * TileM(args), Q(args), sizeof(uint16_t));
 }
 
 uint64_t YBytes(const QmmaLaunchArgs& args)
@@ -114,7 +120,7 @@ int32_t Launch(const QmmaLaunchArgs& args)
 
 uint64_t SymmetricBytes(const QmmaLaunchArgs* args)
 {
-    const uint32_t h = args->comm_interval * 128U;
+    const uint32_t h = args->comm_interval * TileM(*args);
     const uint32_t q = args->n / args->world_size;
     const uint32_t rounds = Catccos::DGemm::Kernel::detail::QuantA2ARoundCount(args->m, h);
     return QmmaLayout::TotalBytes(rounds, args->world_size, args->m, h, q, sizeof(uint16_t), args->aic_num);
@@ -147,6 +153,12 @@ int32_t LaunchQuantMatmulAllToAll(const QmmaLaunchArgs* args)
         using Config = Ascend950QuantMatmulAllToAllConfigFp4<
             float4_e2m1x2_t, Catlass::layout::RowMajor, float4_e2m1x2_t, Catlass::layout::RowMajor, float8_e8m0_t,
             Catlass::layout::RowMajor, float8_e8m0_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor>;
+        return Launch<Config>(*args);
+    }
+    if ((args->n / args->world_size) % 256 != 0) {
+        using Config = Ascend950QuantMatmulAllToAllConfigBf16N128<
+            bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor, bfloat16_t,
+            Catlass::layout::RowMajor>;
         return Launch<Config>(*args);
     }
     using Config =
@@ -194,6 +206,16 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment)
     return (value + alignment - 1U) / alignment * alignment;
 }
 
+/// kernel 内 h = commInterval * L1_TILE_M(编译期 M tile),host 侧必须用同一基准,
+/// 否则 rounds/TX/prodTicket 申请不足(kernel 侧 h 为 8192 而 host 按 4096 计)会越界(aclError 507015)。
+uint32_t TileMFor(const ProblemShape& shape, int64_t format, int64_t epSize)
+{
+    if (format == 2 && epSize > 0 && (shape.n / epSize) % 256U != 0U) {
+        return 256U;
+    }
+    return 128U;
+}
+
 QmmaLaunchArgs MakeLaunchArgs(const ProblemShape& shape, int64_t format, int64_t epSize, int64_t commInterval,
                               uint32_t rank, uint32_t lanes, uint32_t aicNum, uint32_t epoch, uint8_t* symmetric,
                               const void* a, const void* b, const void* aScale, const void* bScale, void* output,
@@ -208,6 +230,7 @@ QmmaLaunchArgs MakeLaunchArgs(const ProblemShape& shape, int64_t format, int64_t
         kRanksPerNode,
         aicNum,
         static_cast<uint32_t>(commInterval),
+        TileMFor(shape, format, epSize),
         lanes,
         epoch,
         static_cast<uint32_t>(format),
@@ -640,7 +663,9 @@ void CheckInputs(const at::Tensor& a, const at::Tensor& b, const c10::optional<a
                     "b_scale must have shape [padded_groups/2, n, 2]");
     }
     TORCH_CHECK(shape.k % 32 == 0, "k must be divisible by 32");
-    TORCH_CHECK(shape.n % epSize == 0 && (shape.n / epSize) % 256 == 0, "n/ep_size must be divisible by 256");
+    const int64_t tileN = format == 2 ? 128 : 256;
+    TORCH_CHECK(shape.n % epSize == 0 && (shape.n / epSize) % tileN == 0,
+                "n/ep_size must be divisible by ", tileN);
 }
 
 void CheckOutput(const at::Tensor& output, const at::Tensor& a, const ProblemShape& shape, int64_t epSize)
@@ -668,14 +693,15 @@ const char* Validate(uint32_t format, const ProblemShape& shape, uint32_t worldS
         aicNum > 64 || 2ULL * aicNum < worldSize) {
         return "invalid format, rank count, lane count, or AIC count";
     }
+    const uint32_t tileN = format == 2 ? 128U : 256U;
     if (shape.m == 0 || shape.n == 0 || shape.k == 0 || shape.k % 32 != 0 || shape.n % worldSize != 0 ||
-        (shape.n / worldSize) % 256 != 0) {
+        (shape.n / worldSize) % tileN != 0) {
         return "invalid M/N/K or N/world_size alignment";
     }
-    if (interval == 0 || interval > std::numeric_limits<uint32_t>::max() / 128U) {
+    const QmmaLaunchArgs args = MakeLaunchArgs(shape, format, worldSize, interval, 0, lanes, aicNum, 0);
+    if (interval == 0 || interval > std::numeric_limits<uint32_t>::max() / args.tile_m) {
         return "invalid comm_interval";
     }
-    const QmmaLaunchArgs args = MakeLaunchArgs(shape, format, worldSize, interval, 0, lanes, aicNum, 0);
     return SymmetricBytes(&args) <= heapBytes ? nullptr : "shape exceeds heap_size";
 }
 

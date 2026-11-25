@@ -435,8 +435,9 @@ def quant_matmul_alltoall(
     if n <= 0 or n % ep_size:
         raise ValueError("n must be positive and divisible by ep_size")
     q = n // ep_size
-    if q % 256:
-        raise ValueError("n/ep_size must be divisible by 256")
+    tile_n = 128 if format == 2 else 256
+    if q % tile_n:
+        raise ValueError(f"n/ep_size must be divisible by {tile_n}")
 
     if format == 2:
         if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:

@@ -28,8 +28,9 @@ class QmmaCase:
             raise ValueError("invalid QMMA operator or input format")
         if self.ep_size not in QMMA_EP_SIZES:
             raise ValueError(f"QMMA case requires EP in {QMMA_EP_SIZES}")
-        if min(self.m, self.n, self.k) < 1 or self.k % 32 or self.n % (256 * self.ep_size):
-            raise ValueError("QMMA requires positive M/N/K, K divisible by 32 and N/EP divisible by 256")
+        align = 128 if self.format == 2 else 256
+        if min(self.m, self.n, self.k) < 1 or self.k % 32 or self.n % (align * self.ep_size):
+            raise ValueError(f"QMMA requires positive M/N/K, K divisible by 32 and N/EP divisible by {align}")
         if self.seed < 0:
             raise ValueError("QMMA seed must be nonnegative")
 
@@ -67,7 +68,7 @@ def qmma_cases(seed: int, ep_size: int) -> list[QmmaCase]:
     return [
         QmmaCase(format=fmt, m=m, n=n, k=k, ep_size=ep_size, seed=seed, scenario={"category": category})
         for category, fmt, n, k, m_values in _GROUPS
-        if n % (256 * ep_size) == 0
+        if n % ((128 if fmt == 2 else 256) * ep_size) == 0
         for m in m_values
     ]
 
@@ -97,7 +98,8 @@ def validate_qmma_topology(*, ep_size: int, nnodes: int, nproc_per_node: int | N
 def required_symmetric_bytes(case: QmmaCase) -> int:
     """Size the heap for the default communication interval and up to 64 AICs."""
     # Match the kernel layout: BF16 TX/Y, cache-line-aligned READY flags, then producer tickets.
-    rows_per_round = 128 * min(32, (case.m + 255) // 256)
+    tile_m = 256 if (case.format == 2 and (case.n // case.ep_size) % 256 != 0) else 128
+    rows_per_round = tile_m * min(32, (case.m + 255) // 256)
     rounds = (case.m + rows_per_round - 1) // rows_per_round
     data_bytes = (rounds * rows_per_round + case.m) * case.n * 2
     ready_bytes = (2 * case.ep_size + 2) * 64

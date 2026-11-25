@@ -3,6 +3,7 @@
 
 """CPU regressions for tiling compatibility, resource budgets and Tensor contracts."""
 
+from collections import Counter
 import importlib.util
 from pathlib import Path
 import shutil
@@ -44,6 +45,7 @@ def test_qmma_plan_and_replay(tmp_path):
         (8, 4, "bf16-k4096-small-m17", "qmma_bf16_small_m"),
         (16, 8, "bf16-k4096-small-m17", "qmma_bf16_small_m"),
         (32, 16, "mxfp8-m10000", "qmma_mxfp8"),
+        (32, 16, "bf16-k4096-small-m17", "qmma_bf16_small_m"),
     ],
 )
 def test_qmma_cross_node_plan(tmp_path, world_size, ranks_per_node, case_id, category):
@@ -91,13 +93,25 @@ def test_qmma_cross_node_plan(tmp_path, world_size, ranks_per_node, case_id, cat
     assert f"--nproc_per_node={ranks_per_node}" in command
 
 
-def test_qmma_ep32_uses_aligned_quantized_cases():
+def test_qmma_ep32_uses_aligned_cases_for_all_formats():
     from .framework.qmma_cases import qmma_cases
 
     cases = qmma_cases(seed=1, ep_size=32)
-    assert cases
-    assert all(case.n % (256 * case.ep_size) == 0 for case in cases)
-    assert all(case.format in {0, 1} for case in cases)
+    assert Counter(case.format for case in cases) == {0: 10, 1: 10, 2: 30}
+    for case in cases:
+        tile_n = 128 if case.format == 2 else 256
+        assert case.n % (tile_n * case.ep_size) == 0
+
+
+def test_qmma_ep32_bf16_heap_accounts_for_256_row_tile():
+    from .framework.qmma_cases import QmmaCase, required_symmetric_bytes
+
+    case = QmmaCase(format=2, m=17, n=12288, k=4096, ep_size=32)
+    # One round with 256 TX rows, 17 output rows, and 32 peers' control data.
+    data_bytes = (256 + 17) * 12288 * 2
+    ready_bytes = (2 * 32 + 2) * 64
+    producer_bytes = 32 * 64 * 64
+    assert required_symmetric_bytes(case) == (data_bytes + ready_bytes + producer_bytes + 4095) // 4096 * 4096
 
 
 @pytest.mark.parametrize("doorbell_mode", [0, 1])

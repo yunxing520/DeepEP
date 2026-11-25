@@ -137,6 +137,11 @@ using Ascend950QuantMatmulAllToAllConfigFp4 =
     Ascend950QuantMatmulAllToAllConfig<ElementA, LayoutA, ElementB, LayoutB, ElementAScale, LayoutAScale, ElementBScale,
                                        LayoutBScale, ElementC, LayoutC, 128, 256, 512>;
 
+// BF16 128 档:N/P 不是 256 整数倍时使用(如 N=12288,P=32 -> 384=3x128),保证 tile 不跨 rank 边界。
+template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC>
+using Ascend950QuantMatmulAllToAllConfigBf16N128 =
+    Ascend950MatmulAllToAllBf16Config<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC, 256, 128, 256>;
+
 // BF16 档:L1 tile 128x256x256,L0 K=64。
 template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC>
 using Ascend950QuantMatmulAllToAllConfigBf16 =
