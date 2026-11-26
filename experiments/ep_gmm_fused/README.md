@@ -85,7 +85,7 @@ fi
 `python -m pip show ascend-deepep` 与 `python -I -m pip show ascend-deepep`；
 后者忽略当前目录、`PYTHONPATH` 和用户级包目录，不作为日常必需参数。
 
-根构建固定 CatCCOS `58754e4efbfe922edafd1d933245c95f0ebb895d`、其 CATLASS gitlink，
+根构建固定 CatCCOS（`renruhai/catccos`）提交 `a61ec760facb9d407b71c2bbe46204df34b65b5d` 及其 CATLASS gitlink，
 SHMEM 沿用主线 [dependencies.lock.json](../../dependencies.lock.json) 固定的提交。
 `SHMEM_SOURCE_PATH` 为同一提交的干净源码，提供 device 私有头；`SHMEM_ROOT` 为已记录身份的外部 SDK。
 `CATCCOS_SOURCE_PATH` 可显式指定；提交不匹配、源码脏或子模块不匹配时停止。

@@ -101,8 +101,9 @@ def required_symmetric_bytes(case: QmmaCase) -> int:
     tile_m = 256 if (case.format == 2 and (case.n // case.ep_size) % 256 != 0) else 128
     rows_per_round = tile_m * min(32, (case.m + 255) // 256)
     rounds = (case.m + rows_per_round - 1) // rows_per_round
-    data_bytes = (rounds * rows_per_round + case.m) * case.n * 2
+    slots = min(rounds, 2)
+    data_bytes = (slots * rows_per_round + case.m) * case.n * 2
     ready_bytes = (2 * case.ep_size + 2) * 64
-    producer_bytes = rounds * case.ep_size * 64 * 64
+    producer_bytes = slots * case.ep_size * 64 * 64
     layout_bytes = data_bytes + ready_bytes + producer_bytes
     return (layout_bytes + 4095) // 4096 * 4096

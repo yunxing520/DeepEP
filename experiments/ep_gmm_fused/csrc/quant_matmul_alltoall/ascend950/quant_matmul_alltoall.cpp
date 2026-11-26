@@ -73,9 +73,17 @@ uint32_t Q(const QmmaLaunchArgs& args)
     return args.n / args.world_size;
 }
 
+/// TX 采用双缓冲:kernel 只使用 min(rounds, TX_STAGES=2) 个物理槽。
+uint32_t Slots(const QmmaLaunchArgs& args)
+{
+    const uint32_t rounds = Rounds(args);
+    return rounds < 2U ? rounds : 2U;
+}
+
 uint64_t TxBytes(const QmmaLaunchArgs& args)
 {
-    return QmmaLayout::TxBytes(Rounds(args), args.world_size, args.comm_interval * TileM(args), Q(args), sizeof(uint16_t));
+    return QmmaLayout::TxBytes(Slots(args), args.world_size, args.comm_interval * TileM(args), Q(args),
+                               sizeof(uint16_t));
 }
 
 uint64_t YBytes(const QmmaLaunchArgs& args)
@@ -123,7 +131,8 @@ uint64_t SymmetricBytes(const QmmaLaunchArgs* args)
     const uint32_t h = args->comm_interval * TileM(*args);
     const uint32_t q = args->n / args->world_size;
     const uint32_t rounds = Catccos::DGemm::Kernel::detail::QuantA2ARoundCount(args->m, h);
-    return QmmaLayout::TotalBytes(rounds, args->world_size, args->m, h, q, sizeof(uint16_t), args->aic_num);
+    const uint32_t slots = rounds < 2U ? rounds : 2U;
+    return QmmaLayout::TotalBytes(slots, args->world_size, args->m, h, q, sizeof(uint16_t), args->aic_num);
 }
 
 uint64_t OutputOffset(const QmmaLaunchArgs* args)
@@ -156,9 +165,9 @@ int32_t LaunchQuantMatmulAllToAll(const QmmaLaunchArgs* args)
         return Launch<Config>(*args);
     }
     if ((args->n / args->world_size) % 256 != 0) {
-        using Config = Ascend950QuantMatmulAllToAllConfigBf16N128<
-            bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor, bfloat16_t,
-            Catlass::layout::RowMajor>;
+        using Config = Ascend950QuantMatmulAllToAllConfigBf16N128<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t,
+                                                                  Catlass::layout::RowMajor, bfloat16_t,
+                                                                  Catlass::layout::RowMajor>;
         return Launch<Config>(*args);
     }
     using Config =
@@ -664,8 +673,7 @@ void CheckInputs(const at::Tensor& a, const at::Tensor& b, const c10::optional<a
     }
     TORCH_CHECK(shape.k % 32 == 0, "k must be divisible by 32");
     const int64_t tileN = format == 2 ? 128 : 256;
-    TORCH_CHECK(shape.n % epSize == 0 && (shape.n / epSize) % tileN == 0,
-                "n/ep_size must be divisible by ", tileN);
+    TORCH_CHECK(shape.n % epSize == 0 && (shape.n / epSize) % tileN == 0, "n/ep_size must be divisible by ", tileN);
 }
 
 void CheckOutput(const at::Tensor& output, const at::Tensor& a, const ProblemShape& shape, int64_t epSize)
